@@ -1,0 +1,23 @@
+# Round 1 (baseline node): protocol + baseline adaptation recipes, all "always adapt", val split only.
+model: yolo11n.pt
+imgsz: 640
+batch: 4
+seed: 0
+source_images: 500          # clean images held out of val/test, used only for source feature stats
+taps: [4, 16, 19, 22]       # stem output + the three neck maps fed to Detect
+trigger_window: 40          # batches after a phase boundary that count as a timely trigger
+stream:
+  split: val
+  phases: [clean, fog, gaussian_noise, motion_blur, snow, contrast, clean]
+  per_phase: 500
+  severity: 5
+methods:
+  - {name: frozen}
+  - {name: bnema_m0.01, bn_momentum: 0.01}
+  - {name: bnema_m0.05, bn_momentum: 0.05}
+  - {name: bnema_m0.05_anchor, bn_momentum: 0.05, bn_anchor: 0.01}
+  - {name: align_all_lr1e-4, adapt: grad, params: all, lr: 1.0e-4}
+  - {name: align_all_lr1e-3, adapt: grad, params: all, lr: 1.0e-3}
+  - {name: align_stem_lr1e-3, adapt: grad, params: stem, lr: 1.0e-3}
+  - {name: align_ent_all_lr1e-4, adapt: grad, params: all, lr: 1.0e-4, loss: {align: 1.0, ent: 1.0}}
+  - {name: bnema_align_all_lr1e-4, bn_momentum: 0.05, adapt: grad, params: all, lr: 1.0e-4}
