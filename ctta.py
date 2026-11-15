@@ -49,6 +49,85 @@ def split_ids(coco, n_source, seed=0):
     return sp
 
 
+KITTI_CLASSES = ["Car", "Van", "Truck", "Pedestrian", "Person_sitting", "Cyclist", "Tram", "Misc"]  # DontCare dropped
+
+
+def kitti_root():
+    import glob
+    for pat in ("/kaggle/input/*/data_object_label_2", "/kaggle/input/*/*/data_object_label_2", "/kaggle/input/*/*/*/data_object_label_2"):
+        hit = glob.glob(pat)
+        if hit:
+            return os.path.dirname(hit[0])
+    if os.environ.get("KITTI_DIR"):
+        return os.environ["KITTI_DIR"]
+    raise FileNotFoundError("KITTI not mounted: attach Kaggle dataset klemenko/kitti-dataset or set KITTI_DIR")
+
+
+def kitti_labels(root, i):
+    out = []
+    for line in open(f"{root}/data_object_label_2/training/label_2/{i}.txt"):
+        f = line.split()
+        if f[0] in KITTI_CLASSES:
+            out.append((KITTI_CLASSES.index(f[0]), *map(float, f[4:8])))  # cls, x1, y1, x2, y2 (pixels)
+    return out
+
+
+def kitti_coco(root, ids):
+    """COCO-format ground truth for KITTI images, so KITTI and COCO share one COCOeval procedure."""
+    from PIL import Image
+    from pycocotools.coco import COCO
+    d = {"images": [], "annotations": [], "categories": [{"id": k + 1, "name": n} for k, n in enumerate(KITTI_CLASSES)]}
+    for i in ids:
+        p = f"{root}/data_object_image_2/training/image_2/{i}.png"
+        w, h = Image.open(p).size
+        d["images"].append({"id": int(i), "file_name": f"{i}.png", "path": p, "width": w, "height": h})
+        for c, x1, y1, x2, y2 in kitti_labels(root, i):
+            d["annotations"].append({"id": len(d["annotations"]) + 1, "image_id": int(i), "category_id": c + 1, "iscrowd": 0,
+                                     "bbox": [x1, y1, x2 - x1, y2 - y1], "area": (x2 - x1) * (y2 - y1)})
+    coco = COCO()
+    coco.dataset = d
+    with contextlib.redirect_stdout(io.StringIO()):
+        coco.createIndex()
+    return coco
+
+
+def finetune_kitti(root, split, ft, base_weights, outdir):
+    """Fine-tune COCO-pretrained weights on the KITTI 3DOP train split. Model selection never sees the eval pool:
+    Ultralytics validates on `holdout` images carved from *train*, and we keep last.pt."""
+    from ultralytics import YOLO
+    work = "/tmp/kitti_yolo"
+    tr = list(split["train"])
+    np.random.RandomState(0).shuffle(tr)
+    parts = {"trainval": tr[:ft.get("holdout", 300)], "train": tr[ft.get("holdout", 300):]}
+    for name, ids in parts.items():
+        os.makedirs(f"{work}/images/{name}", exist_ok=True); os.makedirs(f"{work}/labels/{name}", exist_ok=True)
+        for i in ids:
+            dst = f"{work}/images/{name}/{i}.png"
+            if not os.path.exists(dst):
+                os.symlink(f"{root}/data_object_image_2/training/image_2/{i}.png", dst)
+            from PIL import Image
+            w, h = Image.open(dst).size
+            with open(f"{work}/labels/{name}/{i}.txt", "w") as f:
+                for c, x1, y1, x2, y2 in kitti_labels(root, i):
+                    f.write(f"{c} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} {(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}\n")
+    yaml.safe_dump({"path": work, "train": "images/train", "val": "images/trainval", "names": dict(enumerate(KITTI_CLASSES))},
+                   open(f"{work}/kitti.yaml", "w"))
+    m = YOLO(base_weights)
+    t0 = time.time()
+    m.add_callback("on_fit_epoch_end", lambda tr_: log(
+        f"epoch {tr_.epoch + 1}/{tr_.epochs}", loss={k.split("/")[-1]: round(float(v), 4) for k, v in tr_.label_loss_items(tr_.tloss).items()},
+        map50=round(float(tr_.metrics.get("metrics/mAP50(B)", 0)), 4), map=round(float(tr_.metrics.get("metrics/mAP50-95(B)", 0)), 4),
+        lr=round(float(tr_.optimizer.param_groups[0]["lr"]), 6), secs=round(time.time() - t0)))
+    args = dict(data=f"{work}/kitti.yaml", epochs=ft.get("epochs", 30), imgsz=ft.get("imgsz", 640), batch=ft.get("batch", 32),
+                device=0 if torch.cuda.is_available() else "cpu", workers=4, seed=0, project=f"{outdir}/ft", name="kitti", exist_ok=True, plots=False, verbose=False,
+                freeze=ft.get("freeze", None), close_mosaic=ft.get("close_mosaic", 10), patience=0)
+    log("finetune", **{k: v for k, v in args.items() if k != "data"}, n_train=len(parts["train"]), n_holdout=len(parts["trainval"]))
+    m.train(**args)
+    w = f"{outdir}/ft/kitti/weights/last.pt"
+    log("finetune_done", weights=w, secs=round(time.time() - t0))
+    return w
+
+
 def _patch_imagecorruptions():
     np.float_ = np.float64  # imagecorruptions 1.1.2 predates NumPy 2
     import imagecorruptions.corruptions as C
@@ -86,7 +165,7 @@ def build_frames(coco, root, ids_by_phase, phases, severity, size, seed):
     jobs, meta = [], []
     for p, (name, ids) in enumerate(zip(phases, ids_by_phase)):
         for i in ids:
-            jobs.append((f"{root}/val2017/{coco.imgs[i]['file_name']}", name, severity, seed * 100000 + len(jobs), size))
+            jobs.append((coco.imgs[i]["path"], name, severity, seed * 100000 + len(jobs), size))
             meta.append((p, i))
     imgs, lb = np.empty((len(jobs), size, size, 3), np.uint8), []
     t, last = time.time(), time.time()
@@ -512,10 +591,26 @@ def main():
 
     from pycocotools.coco import COCO
     from ultralytics.data.converter import coco80_to_coco91_class
-    root = os.environ.get("DATA_DIR", "/tmp/coco")
-    ann = fetch_coco(root)
-    with contextlib.redirect_stdout(io.StringIO()):
-        coco = COCO(ann)
+    weights = cfg["model"]
+    if cfg.get("dataset", "coco") == "kitti":
+        root = kitti_root()
+        split = json.load(open("kitti_split.json"))
+        split = {k: [i for i in split[k] if os.path.exists(f"{root}/data_object_image_2/training/image_2/{i}.png")] for k in ("train", "val")}
+        log("kitti", root=root, train=len(split["train"]), val=len(split["val"]))
+        coco = kitti_coco(root, split["val"])
+        cat_map = list(range(1, len(KITTI_CLASSES) + 1))
+        if cfg.get("finetune") and not os.path.exists(cfg.get("weights", "")):
+            weights = finetune_kitti(root, split, cfg["finetune"], cfg["model"], outdir)
+        elif cfg.get("weights"):
+            weights = cfg["weights"]
+    else:
+        root = os.environ.get("DATA_DIR", "/tmp/coco")
+        ann = fetch_coco(root)
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco = COCO(ann)
+        for im in coco.imgs.values():
+            im["path"] = f"{root}/val2017/{im['file_name']}"
+        cat_map = coco80_to_coco91_class()
     sp = split_ids(coco, cfg["source_images"], seed=0)
     st = cfg["stream"]
     rng = np.random.RandomState(cfg["seed"])
@@ -526,8 +621,8 @@ def main():
         ids_by_phase = [first if n == "clean" else ids for n, ids in zip(st["phases"], ids_by_phase)]
     frames = build_frames(coco, root, ids_by_phase, st["phases"], st["severity"], cfg["imgsz"], cfg["seed"])
 
-    det0, bns = load_model(cfg["model"], device)
-    log("model", weights=cfg["model"], params=sum(p.numel() for p in det0.parameters()), bn_layers=len(bns),
+    det0, bns = load_model(weights, device)
+    log("model", weights=weights, params=sum(p.numel() for p in det0.parameters()), bn_layers=len(bns),
         bn_affine=sum(b.weight.numel() * 2 for b in bns), stem_bn_affine=sum(b.weight.numel() * 2 for b in bns if b.layer < 5))
 
     # source feature statistics + per-batch divergence distribution on the clean source split
@@ -577,7 +672,6 @@ def main():
     del src_imgs
     torch.save({"src_stats": src_stats, "src_div": src_div}, f"{outdir}/source_profile.pt")
 
-    cat_map = coco80_to_coco91_class()
     en = Energy(device)
     e0, t0 = en.joules(), time.time()
     time.sleep(5)

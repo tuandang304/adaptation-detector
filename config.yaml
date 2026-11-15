@@ -1,5 +1,7 @@
-# Round 2: matched controls vs the proposed controller and its ablations (val split, 1 seed = screening).
-model: yolo11n.pt
+# Round 3: R2 method set on KITTI-C (val split, 1 seed = screening).
+dataset: kitti
+model: yolo11n.pt          # COCO-pretrained starting point for fine-tuning
+finetune: {epochs: 30, batch: 32, imgsz: 640, holdout: 300}
 imgsz: 640
 batch: 4
 seed: 0
