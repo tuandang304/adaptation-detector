@@ -220,6 +220,23 @@ def swap_bn(module, layer_idx=None, out=None):
     return out
 
 
+def recalibrate_bn(det, paths, size, device, bs=16):
+    """Source BN recalibration (no labels, no gradients): replace every BN's running stats by the cumulative average of
+    batch stats over clean source images at deployment preprocessing. Fixes stats inherited from mosaic training."""
+    bns = [m for m in det.modules() if isinstance(m, AdaBN)]
+    with Pool(os.cpu_count(), initializer=_init_worker) as pool:
+        imgs = np.stack([im for im, _ in pool.imap(_make_frame, [(p, "clean", 1, 0, size) for p in paths], chunksize=8)])
+    with torch.no_grad():
+        for k in range(0, len(imgs), bs):
+            for b in bns:
+                b.update, b.momentum, b.anchor, b.use_src = True, 1.0 / (k // bs + 1), 0.0, False
+            det(torch.from_numpy(imgs[k:k + bs]).to(device).permute(0, 3, 1, 2).float().div_(255))
+    for b in bns:
+        b.update, b.momentum = False, 0.0
+        b.src_mean.copy_(b.running_mean); b.src_var.copy_(b.running_var)
+    log("recal_bn", images=len(imgs), batch=bs)
+
+
 def load_model(weights, device):
     from ultralytics import YOLO
     det = YOLO(weights).model.float()
@@ -648,6 +665,8 @@ def main():
     ap.add_argument("--config", default="config.yaml")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
+    if os.environ.get("RECAL_BN") is not None:  # shard-level override so one commit can run with/without recalibration
+        cfg["recal_bn"] = int(os.environ["RECAL_BN"])
     if os.environ.get("SMOKE"):
         cfg["stream"]["per_phase"], cfg["source_images"] = int(os.environ["SMOKE"]), 16
     outdir = os.environ.get("ORX_OUTPUT_DIR", "out")
@@ -693,6 +712,13 @@ def main():
     frames = build_frames(coco, root, ids_by_phase, st["phases"], st["severity"], cfg["imgsz"], cfg["seed"])
 
     det0, bns = load_model(weights, device)
+    if cfg.get("recal_bn"):
+        if cfg.get("dataset", "coco") == "kitti":
+            pick = np.random.RandomState(0).choice(split["train"], cfg["recal_bn"], replace=False)
+            paths = [f"{root}/data_object_image_2/training/image_2/{i}.png" for i in pick]
+        else:
+            paths = [coco.imgs[i]["path"] for i in sp["source"][:cfg["recal_bn"]]]
+        recalibrate_bn(det0, paths, cfg["imgsz"], device)
     log("model", weights=weights, params=sum(p.numel() for p in det0.parameters()), bn_layers=len(bns),
         bn_affine=sum(b.weight.numel() * 2 for b in bns), stem_bn_affine=sum(b.weight.numel() * 2 for b in bns if b.layer < 5))
 

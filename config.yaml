@@ -1,9 +1,12 @@
-# Round 4: P-v2 (zero-lag routing, direction change-point, Joule-budgeted BN updates) vs R2 controls. COCO-C val, 1 seed.
+# Round 5: P-v2 on KITTI-C + source BN recalibration (shards: RECAL_BN=0 vs 500). val split, 1 seed.
+dataset: kitti
 model: yolo11n.pt
+weights: weights/kitti_yolo11n_ft30.pt   # R3 fine-tune (30 ep from COCO-pretrained, last.pt)
 imgsz: 640
 batch: 4
 seed: 0
 source_images: 500
+recal_bn: 0
 taps: [4, 16, 19, 22]
 signal_taps: ["0.conv"]
 trigger_window: 15
@@ -19,17 +22,7 @@ methods:
   - {name: frozen}
   - {name: bnema_always, bn_momentum: 0.05, bn_anchor: 0.01}
   - {<<: *P1, name: P_fwd_r2}
-  # --- P-v2, dense updates (no budget)
   - {<<: *P2, name: P2_dense}
-  - {<<: *P2, name: P2_dense_z4, cp_z: 4.0}
-  - {<<: *P2, name: P2_dense_k1fixed, cp_z: 0.0}
-  # --- P-v2 with measured-Joule BN-update budget: dense burst after a shift, then budget-limited sparse updates
-  - {<<: *P2, name: P2_b0.3_d30, bn_budget: 0.3, dense: 30}
   - {<<: *P2, name: P2_b0.1_d30, bn_budget: 0.1, dense: 30}
-  - {<<: *P2, name: P2_b0.1_d15, bn_budget: 0.1, dense: 15}
   - {<<: *P2, name: P2_b0.03_d30, bn_budget: 0.03, dense: 30}
-  # --- ablations of P2_dense
-  - {<<: *P2, name: abl2_no_route, route: false, bn_gate: ood}
-  - {<<: *P2, name: abl2_no_cpreset, reset_on_shift: false}
-  - {<<: *P2, name: abl2_route_only_no_cp, cp_mode: none, reset_on_shift: false}
   - {name: frozen_end}
