@@ -361,24 +361,28 @@ def calibrate_energy(det0, mcfg, cfg, device, n=30):
     return out["skip"], max(out["adapt"] - out["skip"], 1e-6)
 
 
-def calibrate_bn_energy(det0, mcfg, cfg, device, n=30):
+def calibrate_bn_energy(det0, mcfg, cfg, device, n=100, reps=3):
     """Measured per-batch extra energy of a forward with BN-EMA updates in every layer vs a plain forward."""
     det = copy.deepcopy(det0)
     bns = [m for m in det.modules() if isinstance(m, AdaBN)]
     x = torch.rand(cfg["batch"], 3, cfg["imgsz"], cfg["imgsz"], device=device)
     en, out = Energy(device), {}
     sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    diffs = []
     with torch.no_grad():
-        for mode in ("skip", "upd", "skip", "upd"):
-            for b in bns:
-                b.momentum, b.update = 0.05, mode == "upd"
-            sync(); e0 = en.joules()
-            for _ in range(n):
-                det(x)
-            sync(); out[mode] = (en.joules() - e0) / n
+        for r in range(reps + 1):  # rep 0 warms clocks and is discarded
+            for mode in ("skip", "upd"):
+                for b in bns:
+                    b.momentum, b.update = 0.05, mode == "upd"
+                sync(); e0 = en.joules()
+                for _ in range(n):
+                    det(x)
+                sync(); out[mode] = (en.joules() - e0) / n
+            if r:
+                diffs.append(out["upd"] - out["skip"])
     del det
-    log("calib_bn", skip_j=round(out["skip"], 4), upd_j=round(out["upd"], 4))
-    return max(out["upd"] - out["skip"], 1e-6)
+    log("calib_bn", extra_j_reps=[round(d_, 4) for d_ in diffs], skip_j=round(out["skip"], 4))
+    return max(float(np.median(diffs)), 1e-6)
 
 
 def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, device, outdir, cat_map, replay=None):
@@ -420,6 +424,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     depth = mcfg.get("burst", 8)                 # bucket depth, in adapt steps
     route = mcfg.get("route", False)             # zero-lag per-batch routing: source vs adapted BN stats
     tau_route = src_div.get("rq99", src_div["q99"]) * mcfg.get("route_mult", 1.0)
+    tau_low = src_div.get(mcfg.get("route_low_q", "rq90"), 0.0) if mcfg.get("route_hyst") else float("inf")
     cp_mode = mcfg.get("cp_mode", "ratio")       # ratio (R2) | dom: direction vs current-domain reference
     cp_k, cp_z, cp_persist, cp_mom = mcfg.get("cp_k", 1.0), mcfg.get("cp_z", 3.0), mcfg.get("cp_persist", 2), mcfg.get("cp_mom", 0.1)
     bn_budget = mcfg.get("bn_budget")            # None: update whenever routed adapted; else J budget per batch as a fraction of one update
@@ -443,7 +448,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             v_, m2 = torch.var_mean(o.detach(), dim=(0, 2, 3), correction=0)
             state["stats"] = (m2, v_)
             state["d"] = divergence({sig_key: (m2, v_)}, src_stats)
-            state["adapted"] = state["d"] > tau_route
+            state["adapted"] = state["d"] > tau_route or (state.get("domain_ood", False) and state["d"] > tau_low)
             state["upd"] = state["adapted"] and state["allow"] and mom > 0
             for b_ in bns:
                 b_.use_src, b_.update = not state["adapted"], state["upd"]
@@ -554,6 +559,8 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             elif cp_run == 0:
                 cp_ref = ((1 - cp_mom) * cp_ref[0] + cp_mom * cs[0], (1 - cp_mom) * cp_ref[1] + cp_mom * cs[1])
                 cp_noise = dd if cp_noise is None else 0.9 * cp_noise + 0.1 * dd
+            # domain state for routing hysteresis: is the current domain (its running reference) out-of-distribution?
+            state["domain_ood"] = 0.5 * (float(kl(*cp_ref, *src_stats[sig_key])) + float(kl(*src_stats[sig_key], *cp_ref))) > tau_route
         elif cp_delta and t >= 3 and cool == 0 and abs(np.log((d_fast + 1e-8) / (d_slow + 1e-8))) > cp_delta:
             event, burst_left, cool, d_slow = True, cp_burst, cp_cool, d_fast
             if reset_on_shift:
@@ -588,7 +595,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         # ---- energy token bucket in measured Joules: debit the expected cost now, then every 25 batches reconcile
         # against the cumulative NVML counter (per-batch reads are coarse; windowed sums are not)
         if bn_budget is not None and replay is None:
-            if upd:
+            if upd and burst_left == 0:  # dense updates right after a detected shift are not charged
                 bn_bucket -= bn_cost
             bn_bucket = min(bn_bucket + bn_refill, bn_cap)
         if sched == "budget" and replay is None:

@@ -1,12 +1,9 @@
-# Round 5: P-v2 on KITTI-C + source BN recalibration (shards: RECAL_BN=0 vs 500). val split, 1 seed.
-dataset: kitti
+# Round 6: P-v3 (routing hysteresis + burst-then-ration Joule budget) vs R4 controls. COCO-C val, 1 seed.
 model: yolo11n.pt
-weights: weights/kitti_yolo11n_ft30.pt   # R3 fine-tune (30 ep from COCO-pretrained, last.pt)
 imgsz: 640
 batch: 4
 seed: 0
 source_images: 500
-recal_bn: 0
 taps: [4, 16, 19, 22]
 signal_taps: ["0.conv"]
 trigger_window: 15
@@ -16,13 +13,17 @@ stream:
   per_phase: 500
   severity: 5
   same_clean_ids: true
-P1: &P1 {bn_momentum: 0.05, bn_anchor: 0.01, bn_gate: ood, reset_after: 3, cp_delta: 0.5, cp_cool: 15, reset_on_shift: true}
 P2: &P2 {bn_momentum: 0.05, bn_anchor: 0.01, route: true, cp_mode: dom, cp_z: 3.0, cp_persist: 2, cp_cool: 8, reset_on_shift: true}
+P3: &P3 {bn_momentum: 0.05, bn_anchor: 0.01, route: true, route_hyst: true, route_low_q: rq90, cp_mode: dom, cp_z: 3.0, cp_persist: 2, cp_cool: 8, reset_on_shift: true}
 methods:
   - {name: frozen}
   - {name: bnema_always, bn_momentum: 0.05, bn_anchor: 0.01}
-  - {<<: *P1, name: P_fwd_r2}
   - {<<: *P2, name: P2_dense}
-  - {<<: *P2, name: P2_b0.1_d30, bn_budget: 0.1, dense: 30}
-  - {<<: *P2, name: P2_b0.03_d30, bn_budget: 0.03, dense: 30}
+  - {<<: *P3, name: P3_dense}
+  - {<<: *P3, name: P3_dense_low50, route_low_q: rq50}
+  - {<<: *P3, name: P3_dense_m0.1, bn_momentum: 0.1}
+  - {<<: *P3, name: P3_b0.25_d30, bn_budget: 0.25, dense: 30}
+  - {<<: *P3, name: P3_b0.1_d30, bn_budget: 0.1, dense: 30}
+  - {<<: *P3, name: P3_b0.1_d20, bn_budget: 0.1, dense: 20}
+  - {<<: *P3, name: P3_b0.05_d30, bn_budget: 0.05, dense: 30}
   - {name: frozen_end}
