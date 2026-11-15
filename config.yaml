@@ -1,23 +1,35 @@
-# Round 1 (baseline node): protocol + baseline adaptation recipes, all "always adapt", val split only.
+# Round 2: matched controls vs the proposed controller and its ablations (val split, 1 seed = screening).
 model: yolo11n.pt
 imgsz: 640
 batch: 4
 seed: 0
 source_images: 500          # clean images held out of val/test, used only for source feature stats
-taps: [4, 16, 19, 22]       # stem output + the three neck maps fed to Detect
-trigger_window: 40          # batches after a phase boundary that count as a timely trigger
+taps: [4, 16, 19, 22]       # alignment-loss taps: stem output + the three neck maps fed to Detect
+signal_taps: ["0.conv"]     # shift signal: first conv, pre-BN -> unaffected by adaptation state
+trigger_window: 15          # batches after a phase boundary that count as a timely detection
 stream:
   split: val
   phases: [clean, fog, gaussian_noise, motion_blur, snow, contrast, clean]
   per_phase: 500
   severity: 5
+  same_clean_ids: true      # both clean phases use identical images -> forgetting is measured, not image-set change
+P: &P {bn_momentum: 0.05, bn_anchor: 0.01, bn_gate: ood, reset_after: 3, cp_delta: 0.5, cp_cool: 15, reset_on_shift: true}
 methods:
+  # --- matched controls
   - {name: frozen}
-  - {name: bnema_m0.01, bn_momentum: 0.01}
-  - {name: bnema_m0.05, bn_momentum: 0.05}
-  - {name: bnema_m0.05_anchor, bn_momentum: 0.05, bn_anchor: 0.01}
-  - {name: align_all_lr1e-4, adapt: grad, params: all, lr: 1.0e-4}
-  - {name: align_all_lr1e-3, adapt: grad, params: all, lr: 1.0e-3}
-  - {name: align_stem_lr1e-3, adapt: grad, params: stem, lr: 1.0e-3}
-  - {name: align_ent_all_lr1e-4, adapt: grad, params: all, lr: 1.0e-4, loss: {align: 1.0, ent: 1.0}}
-  - {name: bnema_align_all_lr1e-4, bn_momentum: 0.05, adapt: grad, params: all, lr: 1.0e-4}
+  - {name: bnema_always, bn_momentum: 0.05, bn_anchor: 0.01}
+  - {name: align_always, adapt: grad, params: all, lr: 1.0e-4}
+  - {name: bnema_align_always, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, params: all, lr: 1.0e-4}
+  - {name: bnema_align_periodic5, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, params: all, lr: 1.0e-4, schedule: periodic, period: 5}
+  # --- proposed: forward-only tier (gated BN-EMA + change-point reset + clean-return restore)
+  - {<<: *P, name: P_fwd}
+  # --- proposed: full controller (adds budgeted gradient tier, bursts after detected shifts)
+  - {<<: *P, name: P_full_b0.2, adapt: grad, params: all, lr: 1.0e-4, schedule: budget, budget_frac: 0.2, cp_burst: 10}
+  - {<<: *P, name: P_full_b0.1, adapt: grad, params: all, lr: 1.0e-4, schedule: budget, budget_frac: 0.1, cp_burst: 10}
+  - {<<: *P, name: P_full_b0.4, adapt: grad, params: all, lr: 1.0e-4, schedule: budget, budget_frac: 0.4, cp_burst: 10}
+  - {<<: *P, name: P_trigger_nobudget, adapt: grad, params: all, lr: 1.0e-4, schedule: trigger, cp_burst: 10}
+  # --- ablations of P_fwd components
+  - {<<: *P, name: abl_no_restore, reset_after: 0}
+  - {<<: *P, name: abl_no_cpreset, reset_on_shift: false}
+  - {<<: *P, name: abl_no_gate, bn_gate: always}
+  - {name: frozen_end}

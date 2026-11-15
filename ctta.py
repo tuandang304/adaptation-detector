@@ -118,8 +118,8 @@ class AdaBN(nn.Module):
         if self.update and self.momentum > 0:
             with torch.no_grad():
                 m, a = self.momentum, self.anchor
-                self.running_mean.mul_(1 - m).add_(x.mean((0, 2, 3)), alpha=m)
-                self.running_var.mul_(1 - m).add_(x.var((0, 2, 3), unbiased=False), alpha=m)
+                # fused cuDNN pass that only updates the running buffers (its normalised output is discarded)
+                F.batch_norm(x.detach(), self.running_mean, self.running_var, None, None, True, m, self.eps)
                 if a > 0:
                     self.running_mean.mul_(1 - a).add_(self.src_mean, alpha=a)
                     self.running_var.mul_(1 - a).add_(self.src_var, alpha=a)
@@ -152,16 +152,20 @@ def load_model(weights, device):
 
 
 class Taps:
-    """Per-channel mean/var of chosen layer outputs, captured on every forward (with grad when enabled)."""
+    """Per-channel mean/var of chosen submodule outputs (paths like "4" or "0.conv"), captured on every forward."""
 
-    def __init__(self, det, layers):
-        self.out = {}
-        for i in layers:
-            det.model[i].register_forward_hook(lambda m, inp, o, i=i: self.out.__setitem__(i, o))
-        self.layers = layers
+    def __init__(self, det, paths):
+        self.out, self.handles = {}, []
+        for p in paths:
+            m = det.model.get_submodule(str(p))
+            self.handles.append(m.register_forward_hook(lambda m, inp, o, p=str(p): self.out.__setitem__(p, o)))
 
-    def stats(self):
-        return {i: (o.mean((0, 2, 3)), o.var((0, 2, 3), unbiased=False)) for i, o in self.out.items()}
+    def stats(self, keys=None):
+        return {k: torch.var_mean(o, dim=(0, 2, 3), correction=0)[::-1] for k, o in self.out.items() if keys is None or k in keys}
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
 
 
 def kl(mt, vt, ms, vs, eps=1e-4):
@@ -215,47 +219,114 @@ def evaluate(coco, dets_by_phase, ids_by_phase):
 
 
 # ----------------------------------------------------------------------------- one method on the stream
-def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, device, outdir, cat_map):
+def snapshot(params):
+    return [p.detach().clone() for p in params]
+
+
+def restore_source(params, src_params, bns, opt):
+    with torch.no_grad():
+        for p, s0 in zip(params, src_params):
+            p.copy_(s0)
+        for b in bns:
+            b.running_mean.copy_(b.src_mean); b.running_var.copy_(b.src_var)
+    if opt is not None:
+        opt.state.clear()
+
+
+def calibrate_energy(det0, mcfg, cfg, device, n=30):
+    """Measured per-batch energy of a skip (forward only) vs an adapt batch (forward+backward+step) on a throwaway copy."""
+    det = copy.deepcopy(det0)
+    bns = [m for m in det.modules() if isinstance(m, AdaBN)]
+    sel = bns if mcfg.get("params", "all") == "all" else [b for b in bns if b.layer < mcfg.get("stem_end", 5)]
+    params = [p for b in sel for p in (b.weight, b.bias)]
+    for p in params:
+        p.requires_grad_(True)
+    opt = torch.optim.Adam(params, lr=1e-12)
+    taps = Taps(det, [str(k) for k in cfg["taps"]])
+    x = torch.rand(cfg["batch"], 3, cfg["imgsz"], cfg["imgsz"], device=device)
+    en, out = Energy(device), {}
+    sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    reads = set()
+    for mode in ("skip", "adapt", "skip", "adapt"):  # second pass is the one kept (first warms clocks)
+        sync(); e0 = en.joules()
+        for _ in range(n):
+            reads.add(en.joules())
+            with torch.set_grad_enabled(mode == "adapt"):
+                det(x)
+                if mode == "adapt":
+                    loss = sum(v.mean() for _, v in taps.stats().values())
+                    opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+        sync(); out[mode] = (en.joules() - e0) / n
+    taps.remove()
+    del det
+    log("calib", skip_j=round(out["skip"], 4), adapt_j=round(out["adapt"], 4), distinct_counter_reads=len(reads), of=4 * n)
+    return out["skip"], max(out["adapt"] - out["skip"], 1e-6)
+
+
+def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, device, outdir, cat_map, replay=None):
+    """replay=None: accuracy pass (controller decides, eval-grade NMS, COCOeval).
+    replay=trace: cost pass that re-executes the recorded decisions with deployment post-processing (conf 0.25 NMS)
+    so latency/energy reflect the adaptation pipeline rather than the evaluation harness."""
     from ultralytics.utils.nms import non_max_suppression
     name = mcfg["name"]
     det = copy.deepcopy(det0)
     bns = [m for m in det.modules() if isinstance(m, AdaBN)]
-    taps = Taps(det, cfg["taps"])
+    align_keys = [str(k) for k in cfg["taps"]]
+    sig_keys = [str(k) for k in cfg.get("signal_taps", cfg["taps"])]
+    taps = Taps(det, sorted(set(align_keys + sig_keys)))
     stem_end = mcfg.get("stem_end", 5)
     adapt_bns = bns if mcfg.get("params", "all") == "all" else [b for b in bns if b.layer < stem_end]
+    mom = mcfg.get("bn_momentum", 0.0)
     for b in bns:
-        b.momentum, b.anchor = mcfg.get("bn_momentum", 0.0), mcfg.get("bn_anchor", 0.0)
+        b.momentum, b.anchor = mom, mcfg.get("bn_anchor", 0.0)
     grad = mcfg.get("adapt", "none") == "grad"
     params = [p for b in adapt_bns for p in (b.weight, b.bias)] if grad else []
     for p in params:
         p.requires_grad_(True)
-    src_params = [p.detach().clone() for p in params]
+    src_params = snapshot(params)
     opt = torch.optim.Adam(params, lr=mcfg.get("lr", 1e-4)) if grad else None
     w_align, w_ent = mcfg.get("loss", {}).get("align", 1.0), mcfg.get("loss", {}).get("ent", 0.0)
     alpha = mcfg.get("ema_alpha", 0.1)
-    sched = mcfg.get("schedule", "always")
+    sched = mcfg.get("schedule", "always")       # always | periodic | trigger | budget
     K = mcfg.get("period", 10)
+    bn_gate = mcfg.get("bn_gate", "always")      # always | ood : BN-EMA only while the signal says out-of-distribution
     tau_hi = src_div["q99"] * mcfg.get("thr_mult", 1.0)
     tau_lo = src_div["q90"] * mcfg.get("thr_mult", 1.0)
-    rho = mcfg.get("budget_frac", 0.2)          # budget = rho * (measured always-adapt step cost) per batch
-    burst = mcfg.get("burst", 8)                # token-bucket depth in steps
-    reset_after = mcfg.get("reset_after", 0)    # consecutive in-domain batches before restoring source params
+    cp_delta = mcfg.get("cp_delta", 0.0)         # |log(fast/slow divergence EMA)| that declares a new domain
+    cp_burst = mcfg.get("cp_burst", 0)           # batches of adaptation granted after a detected shift
+    cp_cool = mcfg.get("cp_cool", 15)            # batches before another shift can be declared
+    reset_on_shift = mcfg.get("reset_on_shift", False)
+    steady = mcfg.get("steady", True)            # adapt while OOD even outside bursts (budget permitting)
+    reset_after = mcfg.get("reset_after", 0)     # consecutive in-domain batches before restoring source state
+    rho = mcfg.get("budget_frac", 0.2)           # energy budget per batch, as a fraction of one adapt step's measured extra energy
+    depth = mcfg.get("burst", 8)                 # bucket depth, in adapt steps
 
     imgs, lbs, meta = frames
     B = cfg["batch"]
     n_batches = (len(imgs) + B - 1) // B
-    ema_stats, d_ema = None, None
+    ema_stats, d_fast, d_slow = None, None, None
     dets_by_phase = [[] for _ in ids_by_phase]
-    trace = {k: np.zeros(n_batches, np.float32) for k in ("div", "adapt", "want", "lat_ms", "energy_j")}
-    bucket, step_cost, base_cost, calm = burst, None, None, 0
+    trace = {k: np.zeros(n_batches, np.float32) for k in ("div", "adapt", "want", "event", "bn_upd", "restore", "lat_ms", "energy_j")}
+    need_sig = sched in ("trigger", "budget") or bn_gate == "ood" or bool(reset_after) or bool(cp_delta)
+    need_stats = need_sig or (grad and bool(w_align))
+    d = 0.0
+    calm, burst_left, cool = 0, 0, 0
+    budget = {}
+    if sched == "budget" and replay is None:
+        e_skip, e_extra = calibrate_energy(det0, mcfg, cfg, device)
+        bucket, cap, refill = depth * e_extra, depth * e_extra, rho * e_extra
+        base_est, extra_est = e_skip, e_extra
+        win_e, win_n, win_debit, win_adapts = 0.0, 0, 0.0, 0
+        budget = {"cal_skip_j": e_skip, "cal_extra_j": e_extra, "budget_j_per_batch": refill}
     energy = Energy(device)
 
-    # warm-up on clean source-like zeros so cudnn autotune/allocator do not land on frame 0
-    with torch.no_grad():
-        for _ in range(5):
+    for i in range(5):  # warm-up (incl. backward for grad methods) so autotune/allocator do not land mid-stream
+        with torch.set_grad_enabled(grad and i >= 3):
             det(torch.zeros(B, 3, cfg["imgsz"], cfg["imgsz"], device=device))
-    for b in bns:
-        b.update = False
+            if grad and i >= 3:
+                opt.zero_grad(set_to_none=True)
+                sum(v.mean() for _, v in taps.stats().values()).backward()
+    restore_source(params, src_params, bns, opt)
     sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
     sync()
     e_start, t_start = energy.joules(), time.time()
@@ -265,8 +336,9 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         t0 = time.perf_counter()
         x = torch.from_numpy(imgs[sl]).to(device, non_blocking=True).permute(0, 3, 1, 2).float().div_(255)
 
-        # ---- decide: adapt this batch?  (decision uses previous batches' signal only)
-        want = d_ema is not None and d_ema > tau_hi
+        # ---- decide from previous batches' signal only
+        ood = d_fast is not None and d_fast > tau_hi
+        want = (burst_left > 0 or (steady and ood)) if cp_burst else ood
         if sched == "always":
             do = grad
         elif sched == "periodic":
@@ -274,127 +346,150 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         elif sched == "trigger":
             do = grad and want
         elif sched == "budget":
-            do = grad and want and bucket >= 1.0
+            do = grad and want and (replay is not None or bucket >= extra_est)
         else:
             raise ValueError(sched)
+        upd = mom > 0 and (bn_gate == "always" or ood)
+        if replay is not None:
+            do, upd = bool(replay["adapt"][t]), bool(replay["bn_upd"][t])
         for b in bns:
-            b.update = mcfg.get("bn_momentum", 0.0) > 0
+            b.update = upd
 
         with torch.set_grad_enabled(do):
             y, raw = det(x)
-            st = taps.stats()
-            d = divergence({i: (m.detach(), v.detach()) for i, (m, v) in st.items()}, src_stats)
+            st = taps.stats() if need_stats else {}
+            if need_sig:
+                d = divergence({k: (m.detach(), v.detach()) for k, (m, v) in st.items() if k in sig_keys}, src_stats)
+            ast = {k: st[k] for k in align_keys} if st else {}
             if do:
                 loss = 0.0
                 if w_align:
                     if ema_stats is None:
-                        ema_stats = {i: (m.detach(), v.detach()) for i, (m, v) in st.items()}
-                    cur = {i: ((1 - alpha) * ema_stats[i][0] + alpha * m, (1 - alpha) * ema_stats[i][1] + alpha * v)
-                           for i, (m, v) in st.items()}
-                    loss = loss + w_align * sum(kl(m, v, *src_stats[i]) for i, (m, v) in cur.items()) / len(cur)
-                    ema_stats = {i: (m.detach(), v.detach()) for i, (m, v) in cur.items()}
+                        ema_stats = {k: (m.detach(), v.detach()) for k, (m, v) in ast.items()}
+                    cur = {k: ((1 - alpha) * ema_stats[k][0] + alpha * m, (1 - alpha) * ema_stats[k][1] + alpha * v)
+                           for k, (m, v) in ast.items()}
+                    loss = loss + w_align * sum(kl(m, v, *src_stats[k]) for k, (m, v) in cur.items()) / len(cur)
+                    ema_stats = {k: (m.detach(), v.detach()) for k, (m, v) in cur.items()}
                 if w_ent:
                     s = torch.cat([z.flatten(2) for z in raw["scores"]], 2) if isinstance(raw["scores"], list) else raw["scores"]
                     p = s.sigmoid().amax(1)  # [B, anchors] max class prob
-                    conf = p > mcfg.get("ent_conf", 0.3)
-                    pe = p[conf].clamp(1e-6, 1 - 1e-6)
+                    pe = p[p > mcfg.get("ent_conf", 0.3)].clamp(1e-6, 1 - 1e-6)
                     if pe.numel():
                         loss = loss + w_ent * -(pe * pe.log() + (1 - pe) * (1 - pe).log()).mean()
                 if torch.is_tensor(loss):
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
                     opt.step()
-            elif ema_stats is not None:  # keep test-stat EMA current even when not adapting
-                ema_stats = {i: ((1 - alpha) * ema_stats[i][0] + alpha * m.detach(), (1 - alpha) * ema_stats[i][1] + alpha * v.detach())
-                             for i, (m, v) in st.items()}
-        d_ema = d if d_ema is None else 0.7 * d_ema + 0.3 * d
+            elif ema_stats is not None and ast:  # keep the test-stat EMA current even when not adapting
+                ema_stats = {k: ((1 - alpha) * ema_stats[k][0] + alpha * m.detach(), (1 - alpha) * ema_stats[k][1] + alpha * v.detach())
+                             for k, (m, v) in ast.items()}
 
-        # ---- clean-return restoration
-        if reset_after and grad:
-            calm = calm + 1 if d_ema < tau_lo else 0
+        # ---- signal bookkeeping: fast/slow EMAs, change-point events, clean-return restoration
+        d_fast = d if d_fast is None else 0.7 * d_fast + 0.3 * d
+        d_slow = d if d_slow is None else 0.95 * d_slow + 0.05 * d
+        event, restored = False, False
+        burst_left, cool = max(burst_left - 1, 0), max(cool - 1, 0)
+        if replay is not None:
+            if replay["restore"][t]:
+                restore_source(params, src_params, bns, opt)
+                ema_stats = None
+        elif cp_delta and t >= 3 and cool == 0 and abs(np.log((d_fast + 1e-8) / (d_slow + 1e-8))) > cp_delta:
+            event, burst_left, cool, d_slow = True, cp_burst, cp_cool, d_fast
+            if reset_on_shift:
+                restore_source(params, src_params, bns, opt)
+                ema_stats, restored = None, True
+        if reset_after and replay is None:
+            calm = calm + 1 if d_fast < tau_lo else 0
             if calm == reset_after:
-                with torch.no_grad():
-                    for p, s0 in zip(params, src_params):
-                        p.copy_(s0)
-                    for b in bns:
-                        b.running_mean.copy_(b.src_mean); b.running_var.copy_(b.src_var)
-                opt.state.clear()
+                restore_source(params, src_params, bns, opt)
+                ema_stats, restored = None, True
 
-        out = non_max_suppression(y.detach(), conf_thres=0.001, iou_thres=0.7, max_det=100)
-        sync()
-        lat = (time.perf_counter() - t0) * 1000
-        e_now = energy.joules()
-        e_batch, e_prev = e_now - e_prev, e_now
-
-        # ---- budget accounting on *measured* energy: learn per-batch cost of skip vs adapt online
-        if sched == "budget":
-            if do:
-                step_cost = e_batch if step_cost is None else 0.9 * step_cost + 0.1 * e_batch
-            else:
-                base_cost = e_batch if base_cost is None else 0.9 * base_cost + 0.1 * e_batch
-            if do and base_cost is not None:
-                extra = max(e_batch - base_cost, 0.0)
-                unit = max((step_cost or e_batch) - base_cost, 1e-6)
-                bucket -= extra / unit
-            elif do:
-                bucket -= 1.0
-            bucket = min(bucket + rho, burst)
-
-        trace["div"][t], trace["adapt"][t], trace["want"][t], trace["lat_ms"][t], trace["energy_j"][t] = d, float(do), float(want), lat, e_batch
+        if replay is not None:  # deployment post-processing; boxes handed to the consumer on CPU
+            out = [o.cpu() for o in non_max_suppression(y.detach(), conf_thres=0.25, iou_thres=0.7, max_det=100)]
+            out = []
+        else:
+            out = non_max_suppression(y.detach(), conf_thres=0.001, iou_thres=0.7, max_det=100)
         for k, o in enumerate(out):
             fi = sl.start + k
             p, img_id = meta[fi]
             r, dw, dh = lbs[fi]
-            o = o.cpu().numpy()
-            for x1, y1, x2, y2, sc, c in o:
+            for x1, y1, x2, y2, sc, c in o.cpu().numpy():
                 x1, x2 = (x1 - dw) / r, (x2 - dw) / r
                 y1, y2 = (y1 - dh) / r, (y2 - dh) / r
                 dets_by_phase[p].append({"image_id": int(img_id), "category_id": cat_map[int(c)],
                                          "bbox": [round(float(x1), 2), round(float(y1), 2), round(float(x2 - x1), 2), round(float(y2 - y1), 2)],
                                          "score": round(float(sc), 5)})
+        sync()
+        lat = (time.perf_counter() - t0) * 1000
+        e_now = energy.joules()
+        e_batch, e_prev = e_now - e_prev, e_now
+
+        # ---- energy token bucket in measured Joules: debit the expected cost now, then every 25 batches reconcile
+        # against the cumulative NVML counter (per-batch reads are coarse; windowed sums are not)
+        if sched == "budget" and replay is None:
+            win_e, win_n = win_e + e_batch, win_n + 1
+            if do:
+                bucket -= extra_est
+                win_debit, win_adapts = win_debit + extra_est, win_adapts + 1
+            if win_n == 25:
+                if win_adapts == 0:
+                    base_est = 0.8 * base_est + 0.2 * win_e / win_n
+                else:
+                    actual = win_e - win_n * base_est
+                    bucket -= actual - win_debit
+                    extra_est = 0.8 * extra_est + 0.2 * max(actual / win_adapts, 0.1 * e_extra)
+                win_e, win_n, win_debit, win_adapts = 0.0, 0, 0.0, 0
+            bucket = min(bucket + refill, cap)
+
+        for k_, v_ in (("div", d), ("adapt", do), ("want", want), ("event", event), ("bn_upd", upd), ("restore", restored), ("lat_ms", lat), ("energy_j", e_batch)):
+            trace[k_][t] = float(v_)
         if not np.isfinite(d):
             log("warn", method=name, batch=t, issue="non-finite divergence")
     sync()
     e_total, wall = energy.joules() - e_start, time.time() - t_start
+    taps.remove()
     for p in params:
         p.requires_grad_(False)
+    lat = trace["lat_ms"][5:]
+    cost = {"j_per_frame": e_total / len(imgs), "energy_source": energy.source, "fps": len(imgs) / wall,
+            "lat_p50": float(np.percentile(lat, 50)), "lat_p95": float(np.percentile(lat, 95)), "lat_p99": float(np.percentile(lat, 99))}
+    if replay is not None:
+        np.savez_compressed(f"{outdir}/costtrace_{name}.npz", lat_ms=trace["lat_ms"], energy_j=trace["energy_j"])
+        return cost
 
     ev = evaluate(coco, dets_by_phase, ids_by_phase)
     phases = cfg["stream"]["phases"]
     shift = [i for i, n in enumerate(phases) if n != "clean"]
-    lat = trace["lat_ms"][5:]
     res = {"method": name, "map50_shift": np.mean([ev[i][1] for i in shift]), "map_shift": np.mean([ev[i][0] for i in shift]),
            "map50_clean_first": ev[0][1], "map50_clean_last": ev[-1][1],
            "map50_by_phase": {f"{i}:{n}": round(ev[i][1], 4) for i, n in enumerate(phases)},
-           "adapt_steps": int(trace["adapt"].sum()), "adapt_frac": float(trace["adapt"].mean()),
-           "energy_j": e_total, "j_per_frame": e_total / len(imgs), "energy_source": energy.source,
-           "lat_p50": float(np.percentile(lat, 50)), "lat_p95": float(np.percentile(lat, 95)), "lat_p99": float(np.percentile(lat, 99)),
-           "fps": len(imgs) / wall, "secs": round(wall, 1)}
-    res.update(trigger_metrics(trace, meta, B, phases, cfg.get("trigger_window", 40)) if sched in ("trigger", "budget") else {})
+           "adapt_steps": int(trace["adapt"].sum()), "adapt_frac": float(trace["adapt"].mean()), "bn_upd_frac": float(trace["bn_upd"].mean()),
+           "eval_pass": {k: round(v, 3) if isinstance(v, float) else v for k, v in cost.items()}, "secs": round(wall, 1), **budget}
+    if cp_delta:
+        res.update(trigger_metrics(trace, meta, B, phases, cfg.get("trigger_window", 15)))
     np.savez_compressed(f"{outdir}/trace_{name}.npz", **trace)
     with open(f"{outdir}/dets_{name}.json", "w") as f:
         json.dump(dets_by_phase, f)
+    res["_trace"] = trace
     return res
 
 
 def trigger_metrics(trace, meta, B, phases, W):
-    """Shift-event reliability (EmbodiTTA-style counts, adapted to batches): onsets = rising edges of the adapt-want signal."""
-    phase_of_batch = np.array([meta[min(t * B, len(meta) - 1)][0] for t in range(len(trace["adapt"]))])
+    """Change-point reliability (EmbodiTTA-style counts, per batch): every phase boundary, incl. the return to clean,
+    is a domain change; a declared event within W batches after it is a hit, any other event is a false trigger."""
+    phase_of_batch = np.array([meta[min(t * B, len(meta) - 1)][0] for t in range(len(trace["event"]))])
     bounds = [int(np.argmax(phase_of_batch == p)) for p in range(1, len(phases))]
-    a = trace["want"] > 0
-    onsets = [t for t in range(len(a)) if a[t] and (t == 0 or not a[t - 1])]
+    onsets = [int(t) for t in np.flatnonzero(trace["event"] > 0)]
     hit, delays = 0, []
     for b in bounds:
         o = [t for t in onsets if b <= t <= b + W]
         if o:
             hit += 1
             delays.append(o[0] - b)
-    in_win = lambda t: any(b <= t <= b + W for b in bounds)
-    # adapting during the first clean phase is a false trigger; so is re-triggering inside a stationary phase
-    false = sum(1 for t in onsets if not in_win(t))
-    clean0 = int(a[phase_of_batch == 0].sum())
-    return {"shifts_detected": hit, "shifts_total": len(bounds), "false_onsets": false,
-            "delay_batches_mean": float(np.mean(delays)) if delays else None, "adapt_in_clean0": clean0}
+    false = sum(1 for t in onsets if not any(b <= t <= b + W for b in bounds))
+    return {"shifts_detected": hit, "shifts_total": len(bounds), "false_triggers": false,
+            "delay_batches_mean": float(np.mean(delays)) if delays else None,
+            "adapt_in_clean0": int((trace["adapt"] > 0)[phase_of_batch == 0].sum())}
 
 
 # ----------------------------------------------------------------------------- main
@@ -426,6 +521,9 @@ def main():
     rng = np.random.RandomState(cfg["seed"])
     pool = sp[st["split"]]
     ids_by_phase = [rng.choice(pool, st["per_phase"], replace=False).tolist() for _ in st["phases"]]
+    if st.get("same_clean_ids"):
+        first = ids_by_phase[st["phases"].index("clean")]
+        ids_by_phase = [first if n == "clean" else ids for n, ids in zip(st["phases"], ids_by_phase)]
     frames = build_frames(coco, root, ids_by_phase, st["phases"], st["severity"], cfg["imgsz"], cfg["seed"])
 
     det0, bns = load_model(cfg["model"], device)
@@ -434,28 +532,56 @@ def main():
 
     # source feature statistics + per-batch divergence distribution on the clean source split
     src_imgs, _, _ = build_frames(coco, root, [sp["source"]], ["clean"], 1, cfg["imgsz"], cfg["seed"])
-    taps = Taps(det0, cfg["taps"])
-    acc, divs, B = {}, [], cfg["batch"]
+    align_keys = [str(k) for k in cfg["taps"]]
+    sig_keys = [str(k) for k in cfg.get("signal_taps", cfg["taps"])]
+    taps = Taps(det0, sorted(set(align_keys + sig_keys)))
+    B = cfg["batch"]
+    per_img = {}  # key -> list of (per-channel mean, per-channel E[x^2]) per source image
     with torch.no_grad():
         for k in range(0, len(src_imgs), B):
-            x = torch.from_numpy(src_imgs[k:k + B]).to(device).permute(0, 3, 1, 2).float().div_(255)
-            det0(x)
-            for i, o in taps.out.items():
-                s = acc.setdefault(i, [0.0, 0.0, 0])
-                s[0] = s[0] + o.sum((0, 2, 3)); s[1] = s[1] + (o ** 2).sum((0, 2, 3)); s[2] += o.numel() // o.shape[1]
-        src_stats = {i: (s0 / n, s1 / n - (s0 / n) ** 2) for i, (s0, s1, n) in acc.items()}
-        for k in range(0, len(src_imgs) - B + 1, B):
-            x = torch.from_numpy(src_imgs[k:k + B]).to(device).permute(0, 3, 1, 2).float().div_(255)
-            det0(x)
-            divs.append(divergence(taps.stats(), src_stats))
-    for i in cfg["taps"]:
-        det0.model[i]._forward_hooks.clear()
+            det0(torch.from_numpy(src_imgs[k:k + B]).to(device).permute(0, 3, 1, 2).float().div_(255))
+            for key, o in taps.out.items():
+                per_img.setdefault(key, []).append(torch.stack([o.mean((2, 3)), (o ** 2).mean((2, 3))], 1).double().cpu())
+    taps.remove()
+    per_img = {k: torch.cat(v) for k, v in per_img.items()}  # [N, 2, C]
+    g = np.random.RandomState(1)
+
+    def batch_stats(idx):
+        out = {}
+        for k, v in per_img.items():
+            m = v[idx, 0].mean(0); out[k] = (m.float().to(device), (v[idx, 1].mean(0) - m ** 2).clamp_min(0).float().to(device))
+        return out
+
+    def expected_stats(pool, n=2000):  # E over random B-image batches of the within-batch mean/var (what test batches see)
+        acc = None
+        for _ in range(n):
+            st_ = batch_stats(g.choice(pool, B, replace=False))
+            acc = st_ if acc is None else {k: (acc[k][0] + st_[k][0], acc[k][1] + st_[k][1]) for k in st_}
+        return {k: (a / n, b / n) for k, (a, b) in acc.items()}
+
+    N = len(src_imgs)
+    src_stats = expected_stats(np.arange(N))
+    divs = []
+    halves = np.array_split(g.permutation(N), 2)
+    for f in range(2):  # out-of-fold: stats from one half, signal on random batches of the other, smoothed like d_fast
+        ref = expected_stats(halves[1 - f], 1000)
+        df = None
+        for t in range(400):
+            st_ = batch_stats(g.choice(halves[f], B, replace=False))
+            d = divergence({k: st_[k] for k in sig_keys}, ref)
+            df = d if df is None else 0.7 * df + 0.3 * d
+            if t >= 3:
+                divs.append(df)
     src_div = {f"q{q}": float(np.percentile(divs, q)) for q in (50, 90, 95, 99)}
     log("source", images=len(src_imgs), **{k: round(v, 4) for k, v in src_div.items()})
     del src_imgs
     torch.save({"src_stats": src_stats, "src_div": src_div}, f"{outdir}/source_profile.pt")
 
     cat_map = coco80_to_coco91_class()
+    en = Energy(device)
+    e0, t0 = en.joules(), time.time()
+    time.sleep(5)
+    log("idle", source=en.source, watts=round((en.joules() - e0) / (time.time() - t0), 2))
     results = []
     only = os.environ.get("METHODS")
     for mcfg in cfg["methods"]:
@@ -463,6 +589,8 @@ def main():
             continue
         try:
             r = run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, device, outdir, cat_map)
+            r.update(run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, device, outdir, cat_map,
+                                replay=r.pop("_trace")))
         except Exception as e:
             log("fail", stage="method", method=mcfg["name"], error=f"{type(e).__name__}: {e}")
             raise
