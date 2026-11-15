@@ -1,37 +1,35 @@
-# Round 3: R2 method set on KITTI-C (val split, 1 seed = screening).
-dataset: kitti
-model: yolo11n.pt          # COCO-pretrained starting point for fine-tuning
-finetune: {epochs: 30, batch: 32, imgsz: 640, holdout: 300}
+# Round 4: P-v2 (zero-lag routing, direction change-point, Joule-budgeted BN updates) vs R2 controls. COCO-C val, 1 seed.
+model: yolo11n.pt
 imgsz: 640
 batch: 4
 seed: 0
-source_images: 500          # clean images held out of val/test, used only for source feature stats
-taps: [4, 16, 19, 22]       # alignment-loss taps: stem output + the three neck maps fed to Detect
-signal_taps: ["0.conv"]     # shift signal: first conv, pre-BN -> unaffected by adaptation state
-trigger_window: 15          # batches after a phase boundary that count as a timely detection
+source_images: 500
+taps: [4, 16, 19, 22]
+signal_taps: ["0.conv"]
+trigger_window: 15
 stream:
   split: val
   phases: [clean, fog, gaussian_noise, motion_blur, snow, contrast, clean]
   per_phase: 500
   severity: 5
-  same_clean_ids: true      # both clean phases use identical images -> forgetting is measured, not image-set change
-P: &P {bn_momentum: 0.05, bn_anchor: 0.01, bn_gate: ood, reset_after: 3, cp_delta: 0.5, cp_cool: 15, reset_on_shift: true}
+  same_clean_ids: true
+P1: &P1 {bn_momentum: 0.05, bn_anchor: 0.01, bn_gate: ood, reset_after: 3, cp_delta: 0.5, cp_cool: 15, reset_on_shift: true}
+P2: &P2 {bn_momentum: 0.05, bn_anchor: 0.01, route: true, cp_mode: dom, cp_z: 3.0, cp_persist: 2, cp_cool: 8, reset_on_shift: true}
 methods:
-  # --- matched controls
   - {name: frozen}
   - {name: bnema_always, bn_momentum: 0.05, bn_anchor: 0.01}
-  - {name: align_always, adapt: grad, params: all, lr: 1.0e-4}
-  - {name: bnema_align_always, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, params: all, lr: 1.0e-4}
-  - {name: bnema_align_periodic5, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, params: all, lr: 1.0e-4, schedule: periodic, period: 5}
-  # --- proposed: forward-only tier (gated BN-EMA + change-point reset + clean-return restore)
-  - {<<: *P, name: P_fwd}
-  # --- proposed: full controller (adds budgeted gradient tier, bursts after detected shifts)
-  - {<<: *P, name: P_full_b0.2, adapt: grad, params: all, lr: 1.0e-4, schedule: budget, budget_frac: 0.2, cp_burst: 10}
-  - {<<: *P, name: P_full_b0.1, adapt: grad, params: all, lr: 1.0e-4, schedule: budget, budget_frac: 0.1, cp_burst: 10}
-  - {<<: *P, name: P_full_b0.4, adapt: grad, params: all, lr: 1.0e-4, schedule: budget, budget_frac: 0.4, cp_burst: 10}
-  - {<<: *P, name: P_trigger_nobudget, adapt: grad, params: all, lr: 1.0e-4, schedule: trigger, cp_burst: 10}
-  # --- ablations of P_fwd components
-  - {<<: *P, name: abl_no_restore, reset_after: 0}
-  - {<<: *P, name: abl_no_cpreset, reset_on_shift: false}
-  - {<<: *P, name: abl_no_gate, bn_gate: always}
+  - {<<: *P1, name: P_fwd_r2}
+  # --- P-v2, dense updates (no budget)
+  - {<<: *P2, name: P2_dense}
+  - {<<: *P2, name: P2_dense_z4, cp_z: 4.0}
+  - {<<: *P2, name: P2_dense_k1fixed, cp_z: 0.0}
+  # --- P-v2 with measured-Joule BN-update budget: dense burst after a shift, then budget-limited sparse updates
+  - {<<: *P2, name: P2_b0.3_d30, bn_budget: 0.3, dense: 30}
+  - {<<: *P2, name: P2_b0.1_d30, bn_budget: 0.1, dense: 30}
+  - {<<: *P2, name: P2_b0.1_d15, bn_budget: 0.1, dense: 15}
+  - {<<: *P2, name: P2_b0.03_d30, bn_budget: 0.03, dense: 30}
+  # --- ablations of P2_dense
+  - {<<: *P2, name: abl2_no_route, route: false, bn_gate: ood}
+  - {<<: *P2, name: abl2_no_cpreset, reset_on_shift: false}
+  - {<<: *P2, name: abl2_route_only_no_cp, cp_mode: none, reset_on_shift: false}
   - {name: frozen_end}

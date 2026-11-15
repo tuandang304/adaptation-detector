@@ -191,9 +191,11 @@ class AdaBN(nn.Module):
         self.register_buffer("running_var", bn.running_var.clone())
         self.register_buffer("src_mean", bn.running_mean.clone())
         self.register_buffer("src_var", bn.running_var.clone())
-        self.momentum, self.anchor, self.update = 0.0, 0.0, False
+        self.momentum, self.anchor, self.update, self.use_src = 0.0, 0.0, False, False
 
     def forward(self, x):
+        if self.use_src:  # routed to the untouched source statistics for this batch
+            return F.batch_norm(x, self.src_mean, self.src_var, self.weight, self.bias, False, 0.0, self.eps)
         if self.update and self.momentum > 0:
             with torch.no_grad():
                 m, a = self.momentum, self.anchor
@@ -342,6 +344,26 @@ def calibrate_energy(det0, mcfg, cfg, device, n=30):
     return out["skip"], max(out["adapt"] - out["skip"], 1e-6)
 
 
+def calibrate_bn_energy(det0, mcfg, cfg, device, n=30):
+    """Measured per-batch extra energy of a forward with BN-EMA updates in every layer vs a plain forward."""
+    det = copy.deepcopy(det0)
+    bns = [m for m in det.modules() if isinstance(m, AdaBN)]
+    x = torch.rand(cfg["batch"], 3, cfg["imgsz"], cfg["imgsz"], device=device)
+    en, out = Energy(device), {}
+    sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    with torch.no_grad():
+        for mode in ("skip", "upd", "skip", "upd"):
+            for b in bns:
+                b.momentum, b.update = 0.05, mode == "upd"
+            sync(); e0 = en.joules()
+            for _ in range(n):
+                det(x)
+            sync(); out[mode] = (en.joules() - e0) / n
+    del det
+    log("calib_bn", skip_j=round(out["skip"], 4), upd_j=round(out["upd"], 4))
+    return max(out["upd"] - out["skip"], 1e-6)
+
+
 def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, device, outdir, cat_map, replay=None):
     """replay=None: accuracy pass (controller decides, eval-grade NMS, COCOeval).
     replay=trace: cost pass that re-executes the recorded decisions with deployment post-processing (conf 0.25 NMS)
@@ -379,6 +401,12 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     reset_after = mcfg.get("reset_after", 0)     # consecutive in-domain batches before restoring source state
     rho = mcfg.get("budget_frac", 0.2)           # energy budget per batch, as a fraction of one adapt step's measured extra energy
     depth = mcfg.get("burst", 8)                 # bucket depth, in adapt steps
+    route = mcfg.get("route", False)             # zero-lag per-batch routing: source vs adapted BN stats
+    tau_route = src_div.get("rq99", src_div["q99"]) * mcfg.get("route_mult", 1.0)
+    cp_mode = mcfg.get("cp_mode", "ratio")       # ratio (R2) | dom: direction vs current-domain reference
+    cp_k, cp_z, cp_persist, cp_mom = mcfg.get("cp_k", 1.0), mcfg.get("cp_z", 3.0), mcfg.get("cp_persist", 2), mcfg.get("cp_mom", 0.1)
+    bn_budget = mcfg.get("bn_budget")            # None: update whenever routed adapted; else J budget per batch as a fraction of one update
+    dense = mcfg.get("dense", 0)                 # batches of unconditional BN updates right after a detected shift
 
     imgs, lbs, meta = frames
     B = cfg["batch"]
@@ -386,11 +414,28 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     ema_stats, d_fast, d_slow = None, None, None
     dets_by_phase = [[] for _ in ids_by_phase]
     trace = {k: np.zeros(n_batches, np.float32) for k in ("div", "adapt", "want", "event", "bn_upd", "restore", "lat_ms", "energy_j")}
-    need_sig = sched in ("trigger", "budget") or bn_gate == "ood" or bool(reset_after) or bool(cp_delta)
+    need_sig = (sched in ("trigger", "budget") or bn_gate == "ood" or bool(reset_after) or bool(cp_delta) or cp_mode == "dom") and not route
     need_stats = need_sig or (grad and bool(w_align))
     d = 0.0
     calm, burst_left, cool = 0, 0, 0
     budget = {}
+    state = {"allow": True, "d": 0.0, "adapted": False, "upd": False, "stats": None}
+    sig_key = sig_keys[0]
+    if route:
+        def _route(m_, i_, o):
+            v_, m2 = torch.var_mean(o.detach(), dim=(0, 2, 3), correction=0)
+            state["stats"] = (m2, v_)
+            state["d"] = divergence({sig_key: (m2, v_)}, src_stats)
+            state["adapted"] = state["d"] > tau_route
+            state["upd"] = state["adapted"] and state["allow"] and mom > 0
+            for b_ in bns:
+                b_.use_src, b_.update = not state["adapted"], state["upd"]
+        route_handle = det.model.get_submodule(sig_key).register_forward_hook(_route)
+    cp_ref, cp_noise, cp_run, cp_buf = src_stats[sig_key], None, 0, []
+    if bn_budget is not None and replay is None:
+        bn_cost = calibrate_bn_energy(det0, mcfg, cfg, device)
+        bn_bucket, bn_cap, bn_refill = depth * bn_cost, depth * bn_cost, bn_budget * bn_cost
+        budget.update({"cal_bn_extra_j": bn_cost, "bn_budget_j_per_batch": bn_refill})
     if sched == "budget" and replay is None:
         e_skip, e_extra = calibrate_energy(det0, mcfg, cfg, device)
         bucket, cap, refill = depth * e_extra, depth * e_extra, rho * e_extra
@@ -431,13 +476,18 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         upd = mom > 0 and (bn_gate == "always" or ood)
         if replay is not None:
             do, upd = bool(replay["adapt"][t]), bool(replay["bn_upd"][t])
-        for b in bns:
-            b.update = upd
+        if route:  # the hook decides routing/update inside the forward; here only whether an update is affordable
+            state["allow"] = upd if replay is not None else (bn_budget is None or burst_left > 0 or bn_bucket >= bn_cost)
+        else:
+            for b in bns:
+                b.update = upd
 
         with torch.set_grad_enabled(do):
             y, raw = det(x)
             st = taps.stats() if need_stats else {}
-            if need_sig:
+            if route:
+                d, upd = state["d"], state["upd"]
+            elif need_sig:
                 d = divergence({k: (m.detach(), v.detach()) for k, (m, v) in st.items() if k in sig_keys}, src_stats)
             ast = {k: st[k] for k in align_keys} if st else {}
             if do:
@@ -472,6 +522,21 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             if replay["restore"][t]:
                 restore_source(params, src_params, bns, opt)
                 ema_stats = None
+        elif cp_mode == "dom":
+            cs = state["stats"] if route else tuple(x_.detach() for x_ in st[sig_key])
+            dd = 0.5 * (float(kl(*cs, *cp_ref)) + float(kl(*cp_ref, *cs)))
+            thr = max(cp_k * src_div["rq99"], cp_z * cp_noise) if cp_noise is not None else cp_k * src_div["rq99"]
+            cp_run = cp_run + 1 if dd > thr else 0
+            cp_buf = (cp_buf + [cs])[-cp_persist:]
+            if cp_run >= cp_persist and cool == 0:
+                event, burst_left, cool, cp_run, cp_noise = True, max(cp_burst, dense), cp_cool, 0, None
+                cp_ref = (torch.stack([a_ for a_, _ in cp_buf]).mean(0), torch.stack([b_ for _, b_ in cp_buf]).mean(0))
+                if reset_on_shift:
+                    restore_source(params, src_params, bns, opt)
+                    ema_stats, restored = None, True
+            elif cp_run == 0:
+                cp_ref = ((1 - cp_mom) * cp_ref[0] + cp_mom * cs[0], (1 - cp_mom) * cp_ref[1] + cp_mom * cs[1])
+                cp_noise = dd if cp_noise is None else 0.9 * cp_noise + 0.1 * dd
         elif cp_delta and t >= 3 and cool == 0 and abs(np.log((d_fast + 1e-8) / (d_slow + 1e-8))) > cp_delta:
             event, burst_left, cool, d_slow = True, cp_burst, cp_cool, d_fast
             if reset_on_shift:
@@ -505,6 +570,10 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
 
         # ---- energy token bucket in measured Joules: debit the expected cost now, then every 25 batches reconcile
         # against the cumulative NVML counter (per-batch reads are coarse; windowed sums are not)
+        if bn_budget is not None and replay is None:
+            if upd:
+                bn_bucket -= bn_cost
+            bn_bucket = min(bn_bucket + bn_refill, bn_cap)
         if sched == "budget" and replay is None:
             win_e, win_n = win_e + e_batch, win_n + 1
             if do:
@@ -527,6 +596,8 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     sync()
     e_total, wall = energy.joules() - e_start, time.time() - t_start
     taps.remove()
+    if route:
+        route_handle.remove()
     for p in params:
         p.requires_grad_(False)
     lat = trace["lat_ms"][5:]
@@ -544,7 +615,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
            "map50_by_phase": {f"{i}:{n}": round(ev[i][1], 4) for i, n in enumerate(phases)},
            "adapt_steps": int(trace["adapt"].sum()), "adapt_frac": float(trace["adapt"].mean()), "bn_upd_frac": float(trace["bn_upd"].mean()),
            "eval_pass": {k: round(v, 3) if isinstance(v, float) else v for k, v in cost.items()}, "secs": round(wall, 1), **budget}
-    if cp_delta:
+    if cp_delta or cp_mode == "dom":
         res.update(trigger_metrics(trace, meta, B, phases, cfg.get("trigger_window", 15)))
     np.savez_compressed(f"{outdir}/trace_{name}.npz", **trace)
     with open(f"{outdir}/dets_{name}.json", "w") as f:
@@ -656,7 +727,7 @@ def main():
 
     N = len(src_imgs)
     src_stats = expected_stats(np.arange(N))
-    divs = []
+    divs, raw = [], []
     halves = np.array_split(g.permutation(N), 2)
     for f in range(2):  # out-of-fold: stats from one half, signal on random batches of the other, smoothed like d_fast
         ref = expected_stats(halves[1 - f], 1000)
@@ -665,9 +736,11 @@ def main():
             st_ = batch_stats(g.choice(halves[f], B, replace=False))
             d = divergence({k: st_[k] for k in sig_keys}, ref)
             df = d if df is None else 0.7 * df + 0.3 * d
+            raw.append(d)
             if t >= 3:
                 divs.append(df)
     src_div = {f"q{q}": float(np.percentile(divs, q)) for q in (50, 90, 95, 99)}
+    src_div.update({f"rq{q}": float(np.percentile(raw, q)) for q in (50, 90, 99)})
     log("source", images=len(src_imgs), **{k: round(v, 4) for k, v in src_div.items()})
     del src_imgs
     torch.save({"src_stats": src_stats, "src_div": src_div}, f"{outdir}/source_profile.pt")
