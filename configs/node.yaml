@@ -1,5 +1,5 @@
 # Stock YOLO26n fine-tuned from its COCO checkpoint with the fixed screening recipe; one process per GPU.
-smoke: true   # step 3: one full epoch per dataset, every stage, before the 30-epoch run
+smoke: false
 data_dir: /tmp/bench_data
 model: yolo26n
 epochs: 30
