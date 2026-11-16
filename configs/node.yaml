@@ -1,5 +1,12 @@
-# Probe (CPU): which way of fetching the public Kaggle copies works from inside a Kaggle kernel.
-probe:
-  - hongngnguyn/exdarkdataset
-  - abedhossain/ruod-himu
-  - markmoawad/cityscapes-trainval
+# Stock YOLO26n fine-tuned from its COCO checkpoint with the fixed screening recipe; one process per GPU.
+smoke: true   # step 3: one full epoch per dataset, every stage, before the 30-epoch run
+data_dir: /tmp/bench_data
+model: yolo26n
+epochs: 30
+imgsz: 640
+seed: 0
+eval_splits: [valid]   # test splits stay closed during screening
+# one list per GPU, trained in order; on a single-GPU host the lists run one after another
+gpu_plan: [[ruod], [visdrone, cityscapes, exdark]]
+# written out instead of optimizer=auto so that every dataset gets the same optimizer whatever its iteration count
+extra: {optimizer: MuSGD, lr0: 0.01, lrf: 0.01, momentum: 0.9, warmup_bias_lr: 0.0}

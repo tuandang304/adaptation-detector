@@ -17,6 +17,7 @@ import os
 import random
 import shutil
 import subprocess
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -121,20 +122,34 @@ def prep_visdrone(out: Path) -> Path:
     return finish(out, VISDRONE, manifest)
 
 
-def fetch_kaggle(ref: str, raw: Path, members: list[str]) -> Path:
-    """Download a public Kaggle dataset zip anonymously and extract the listed member patterns into raw/<slug>.
-    (A batch kernel cannot attach datasets at run time, and the same call works on Colab.)"""
+def fetch_kaggle(ref: str, raw: Path) -> Path:
+    """Fetch a public Kaggle dataset; returns the directory holding its files.
+    Inside a Kaggle kernel: kagglehub over HTTP with the kernel's own identity (a batch kernel cannot attach a
+    dataset at run time, and kagglehub only tries to attach when KAGGLE_KERNEL_RUN_TYPE is set).
+    Elsewhere: anonymous download, which Kaggle answers with 404 from cloud hosts such as Colab."""
     dst = raw / ref.split("/")[1]
-    if not (dst / ".done").exists():
-        raw.mkdir(parents=True, exist_ok=True)
+    if (dst / ".done").exists():
+        return dst
+    raw.mkdir(parents=True, exist_ok=True)
+    print(f"[data] downloading kaggle:{ref}", flush=True)
+    t0 = time.time()
+    if "KAGGLE_USER_SECRETS_TOKEN" in os.environ:
+        import kagglehub
+        os.environ["KAGGLEHUB_CACHE"] = str(raw / "kagglehub")
+        run_type = os.environ.pop("KAGGLE_KERNEL_RUN_TYPE", None)
+        try:
+            dst = Path(kagglehub.dataset_download(ref))
+        finally:
+            if run_type is not None:
+                os.environ["KAGGLE_KERNEL_RUN_TYPE"] = run_type
+    else:
         z = raw / (ref.split("/")[1] + ".zip")
-        print(f"[data] downloading kaggle:{ref}", flush=True)
         subprocess.run(["curl", "-L", "-sS", "--fail", "--retry", "5", "--retry-delay", "10", "-o", str(z),
                         f"https://www.kaggle.com/api/v1/datasets/download/{ref}"], check=True)
-        print(f"[data] kaggle:{ref} zip {z.stat().st_size / 1e9:.2f} GB, extracting", flush=True)
-        subprocess.run(["unzip", "-q", "-o", str(z), *members, "-d", str(dst)], check=True)
+        subprocess.run(["unzip", "-q", "-o", str(z), "-d", str(dst)], check=True)
         z.unlink()
         (dst / ".done").touch()
+    print(f"[data] kaggle:{ref} ready in {time.time() - t0:.0f}s at {dst}", flush=True)
     return dst
 
 
@@ -159,7 +174,7 @@ def _cityscapes_boxes(args: tuple[str, str]) -> tuple[str, list]:
 
 def prep_cityscapes(out: Path) -> Path:
     from multiprocessing.pool import ThreadPool  # PIL decoding and numpy release the GIL
-    raw = fetch_kaggle(CITYSCAPES_REF, out.parent / "raw", ["leftImg8bit/*", "gtFine/*_instanceIds.png"])
+    raw = fetch_kaggle(CITYSCAPES_REF, out.parent / "raw")
     manifest = {"source": f"kaggle:{CITYSCAPES_REF} (Cityscapes leftImg8bit + gtFine instanceIds)", "splits": {}}
     for split, src in {"train": "train", "valid": "val"}.items():
         imgs = sorted((raw / "leftImg8bit" / src).rglob("*_leftImg8bit.png"))
@@ -179,15 +194,16 @@ EXDARK_LIST = "https://raw.githubusercontent.com/cs-chan/Exclusively-Dark-Image-
 
 def prep_exdark(out: Path) -> Path:
     import csv
-    raw = fetch_kaggle(EXDARK_REF, out.parent / "raw", ["*"])
-    _download(EXDARK_LIST, raw / "imageclasslist.txt")
+    raw = fetch_kaggle(EXDARK_REF, out.parent / "raw")
+    lst = out.parent / "raw" / "exdark_imageclasslist.txt"  # the fetched directory may be read-only cache
+    _download(EXDARK_LIST, lst)
     boxes: dict[str, list] = {}
     with open(raw / "annotations.csv") as f:
         for r in csv.DictReader(f):
             boxes.setdefault(r["image_path"].rsplit(".", 1)[0].lower(), []).append(
                 (int(r["class"]), int(r["x_tl"]), int(r["y_tl"]), int(r["x_br"]), int(r["y_br"])))
     files = {p.stem.lower(): p for p in (raw / "Dataset").rglob("*") if p.is_file()}
-    rows = [ln.split() for ln in (raw / "imageclasslist.txt").read_text().splitlines()[1:] if ln.strip()]
+    rows = [ln.split() for ln in lst.read_text().splitlines()[1:] if ln.strip()]
     manifest = {"source": f"kaggle:{EXDARK_REF} + official imageclasslist.txt (columns: class, light, in/out, split)",
                 "splits": {}, "light_types": {r[0].rsplit(".", 1)[0].lower(): int(r[2]) for r in rows}}
     for split, code in {"train": "1", "valid": "2", "test": "3"}.items():
@@ -214,7 +230,7 @@ def _coco_items(js: dict, img_dir: Path, keep: set[str] | None = None) -> tuple[
 
 
 def prep_ruod(out: Path) -> Path:
-    raw = fetch_kaggle(RUOD_REF, out.parent / "raw", ["RUOD_pic/*", "RUOD_ANN/*"])
+    raw = fetch_kaggle(RUOD_REF, out.parent / "raw")
     tr = json.loads(next((raw / "RUOD_ANN").glob("*train*.json")).read_text())
     te = json.loads(next((raw / "RUOD_ANN").glob("*test*.json")).read_text())
     files = sorted(im["file_name"] for im in tr["images"])
