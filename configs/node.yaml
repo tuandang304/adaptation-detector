@@ -7,7 +7,7 @@ imgsz: 640
 seed: 0
 eval_splits: [valid]   # test splits stay closed during screening
 shift_eval: true       # also score val under four fixed degradations (dark, haze, noise, blur)
-mods: []               # stock model
+mods: [mix, cons]
 # one list per GPU, trained in order; on a single-GPU host the lists run one after another
 gpu_plan: [[ruod], [visdrone, cityscapes, exdark]]
 # written out instead of optimizer=auto so that every dataset gets the same optimizer whatever its iteration count
