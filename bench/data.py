@@ -258,7 +258,7 @@ BDD_SPLITS = {"train": (("train",), "daytime", "clear"), "valid": (("val",), "da
               "duskrain": (("train", "val"), "dawn/dusk", "rainy"), "dayrain": (("train", "val"), "daytime", "rainy")}
 
 
-def _bdd_items(recs: dict[str, list], img_root: Path, split: str) -> list[Item]:
+def _bdd_items(recs: dict[str, list], where: dict[str, dict[str, Path]], split: str) -> list[Item]:
     files, tod, weather = BDD_SPLITS[split]
     items = []
     for f in files:
@@ -272,7 +272,8 @@ def _bdd_items(recs: dict[str, list], img_root: Path, split: str) -> list[Item]:
                 if c in BDD and "box2d" in lab:
                     b = lab["box2d"]
                     boxes.append((BDD.index(c), b["x1"], b["y1"], b["x2"], b["y2"]))
-            items.append((img_root / f / r["name"], boxes, []))
+            if r["name"] in where[f]:
+                items.append((where[f][r["name"]], boxes, []))
     items.sort(key=lambda i: i[0].name)
     return sorted(random.Random(0).sample(items, min(BDD_CAP[split], len(items))), key=lambda i: i[0].name)
 
@@ -285,11 +286,13 @@ def prep_bdd(out: Path) -> Path:
         path = next(raw.rglob(f"bdd100k_labels_images_{f}.json"))
         recs[f] = [{k: r.get(k) for k in keep} for r in json.loads(path.read_text())]
     img_root = next(p for p in raw.rglob("100k") if (p / "train").is_dir() and p.parent.name == "images")
+    # this copy keeps the train images in sub-folders (train/trainA, train/trainB), so look them up by name
+    where = {f: {p.name: p for p in (img_root / f).rglob("*.jpg")} for f in ("train", "val")}
+    print(f"[data] bdd images found: { {f: len(v) for f, v in where.items()} }", flush=True)
     manifest = {"source": f"kaggle:{BDD_REF}; train = daytime+clear of official train, tests = other conditions; "
                           f"caps {BDD_CAP} (seed 0)", "splits": {}}
     for split in BDD_SPLITS:
-        items = [i for i in _bdd_items(recs, img_root, split) if i[0].exists()]
-        manifest["splits"][split] = write_split(out, split, BDD, items)
+        manifest["splits"][split] = write_split(out, split, BDD, _bdd_items(recs, where, split))
     n = {k: v["images"] for k, v in manifest["splits"].items()}
     assert n["train"] >= 8000 and all(v >= 300 for v in n.values()), f"unexpected BDD100K split sizes {n}"
     return finish(out, BDD, manifest)
