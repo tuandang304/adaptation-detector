@@ -3,7 +3,7 @@
 One run = one stream, many method configs (config.yaml). Every method starts from the same source model,
 sees the same frames in the same order, and is scored with the same COCOeval procedure.
 """
-import argparse, contextlib, copy, hashlib, io, json, os, subprocess, sys, time, zipfile
+import argparse, contextlib, copy, hashlib, io, json, os, shutil, subprocess, sys, time, zipfile
 from multiprocessing import Pool
 
 import cv2
@@ -124,6 +124,68 @@ def finetune_kitti(root, split, ft, base_weights, outdir):
     log("finetune", **{k: v for k, v in args.items() if k != "data"}, n_train=len(parts["train"]), n_holdout=len(parts["trainval"]))
     m.train(**args)
     w = f"{outdir}/ft/kitti/weights/last.pt"
+    log("finetune_done", weights=w, secs=round(time.time() - t0))
+    return w
+
+
+def finetune_robust(ft, base_weights, outdir):
+    """Robust source model: fine-tune on COCO train2017, optionally with photometric AugMix whose ops (posterize, solarize,
+    autocontrast, equalize) are disjoint from the test corruptions. augmix=0 is the matched plain fine-tune control."""
+    import subprocess
+    from torchvision.transforms import v2
+    from ultralytics import YOLO
+    from ultralytics.models.yolo.detect import DetectionTrainer
+    work = "/tmp/rob/coco"
+    src = os.environ.get("COCO_TRAIN_DIR")  # an already-present image folder (Kaggle dataset mount / local smoke)
+    if not src:  # a mounted COCO dataset saves the 19 GB download
+        src = next((d for d, _, fs in os.walk("/kaggle/input") if os.path.basename(d) == "train2017" and len(fs) > 100000), None)
+    log("train_images", src=src or "download")
+    split = os.path.basename(src.rstrip("/")) if src else "train2017"
+    os.makedirs(f"{work}/images", exist_ok=True)
+    if not os.path.isdir(f"{work}/labels/{split}"):
+        torch.hub.download_url_to_file("https://github.com/ultralytics/assets/releases/download/v0.0.0/coco2017labels.zip", "/tmp/rob/l.zip", progress=False)
+        subprocess.run(["unzip", "-q", "-o", "/tmp/rob/l.zip", f"coco/labels/{split}/*", "-d", "/tmp/rob"], check=True)
+    if not os.path.exists(f"{work}/images/{split}"):
+        if src:
+            os.symlink(src, f"{work}/images/{split}")
+        else:
+            t = time.time()
+            subprocess.run(["curl", "-sSfL", "--retry", "5", "-C", "-", "-o", "/tmp/rob/t.zip", "http://images.cocodataset.org/zips/train2017.zip"], check=True)
+            log("download", what="train2017", secs=round(time.time() - t))
+            subprocess.run(["unzip", "-q", "-o", "/tmp/rob/t.zip", "-d", f"{work}/images"], check=True)
+            os.remove("/tmp/rob/t.zip")
+    m = YOLO(base_weights)
+    with open(f"{work}/list.txt", "w") as f:  # a list keeps the symlinked path, so labels resolve under {work}/labels
+        f.write("\n".join(f"{work}/images/{split}/{n}" for n in sorted(os.listdir(f"{work}/images/{split}"))))
+    yaml.safe_dump({"path": work, "train": "list.txt", "val": "list.txt", "names": m.names}, open("/tmp/rob/data.yaml", "w"))
+    p_aug = float(os.environ.get("AUGMIX", ft.get("augmix", 0.0)))
+
+    class PhotoAugMix(v2.AugMix):
+        _PARTIAL_AUGMENTATION_SPACE = {k: v2.AugMix._PARTIAL_AUGMENTATION_SPACE[k] for k in ("Posterize", "Solarize", "AutoContrast", "Equalize")}
+    aug = PhotoAugMix(severity=ft.get("severity", 3))
+
+    class Trainer(DetectionTrainer):
+        def preprocess_batch(self, batch):
+            img = batch["img"].to(self.device)  # uint8; chunks of 8 share one sampled op chain
+            for k in range(0, len(img), 8):
+                if np.random.rand() < p_aug:
+                    img[k:k + 8] = aug(img[k:k + 8])
+            batch["img"] = img
+            return super().preprocess_batch(batch)
+
+    t0 = time.time()
+    m.add_callback("on_fit_epoch_end", lambda tr_: log(
+        f"epoch {tr_.epoch + 1}/{tr_.epochs}", loss={k.split("/")[-1]: round(float(v), 4) for k, v in tr_.label_loss_items(tr_.tloss).items()},
+        lr=round(float(tr_.optimizer.param_groups[0]["lr"]), 6), secs=round(time.time() - t0)))
+    smoke = bool(os.environ.get("SMOKE"))
+    args = dict(data="/tmp/rob/data.yaml", epochs=1 if smoke else ft.get("epochs", 8), imgsz=ft.get("imgsz", 640), batch=8 if smoke else ft.get("batch", 64),
+                fraction=0.004 if smoke else 1.0, device=0 if torch.cuda.is_available() else "cpu", workers=4, seed=0, project=f"{outdir}/ft",
+                name="robust", exist_ok=True, plots=False, verbose=False, val=False, patience=0, optimizer="SGD", lr0=ft.get("lr0", 0.002),
+                lrf=0.1, warmup_epochs=0.5, close_mosaic=ft.get("close_mosaic", 2))
+    log("finetune", **{k: v for k, v in args.items() if k != "data"}, augmix=p_aug, ops=list(PhotoAugMix._PARTIAL_AUGMENTATION_SPACE))
+    m.train(trainer=Trainer, **args)
+    w = f"{outdir}/robust_augmix{p_aug:g}.pt"
+    shutil.copy(f"{outdir}/ft/robust/weights/last.pt", w)
     log("finetune_done", weights=w, secs=round(time.time() - t0))
     return w
 
@@ -476,6 +538,23 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             for b_ in bns:
                 b_.use_src, b_.update = not state["adapted"], state["upd"]
         route_handle = det.model.get_submodule(sig_key).register_forward_hook(_route)
+    route2_handle = None
+    if route and mcfg.get("route2"):  # deeper tap for shifts invisible at conv0 (jpeg, pixelate); only valid while the stem runs on source stats
+        k2, sd2 = str(cfg["signal2"]), src_div["tap2"]
+        L2 = int(k2.split(".")[0])
+
+        def _route2(m_, i_, o):
+            if state["adapted"]:
+                return
+            v_, m2 = torch.var_mean(o.detach(), dim=(0, 2, 3), correction=0)
+            d2 = divergence({k2: (m2, v_)}, src_stats)
+            state["deep"] = d2 > sd2["rq99"] or (state.get("deep", False) and d2 > sd2["rq90"])
+            if state["deep"]:
+                state["upd"] = state["allow"] and mom > 0
+                for b_ in bns:
+                    if b_.layer >= L2:
+                        b_.use_src, b_.update = False, state["upd"]
+        route2_handle = det.model.get_submodule(k2).register_forward_hook(_route2)
     cp_ref, cp_noise, cp_run, cp_buf = src_stats[sig_key], None, 0, []
     if bn_budget is not None and replay is None:
         bn_cost = calibrate_bn_energy(det0, mcfg, cfg, device)
@@ -666,6 +745,8 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     taps.remove()
     if route:
         route_handle.remove()
+        if route2_handle:
+            route2_handle.remove()
     for p in params:
         p.requires_grad_(False)
     lat = trace["lat_ms"][5:]
@@ -758,6 +839,10 @@ def main():
         for im in coco.imgs.values():
             im["path"] = f"{root}/val2017/{im['file_name']}"
         cat_map = coco80_to_coco91_class()
+        if os.environ.get("WEIGHTS") or cfg.get("weights"):
+            weights = os.environ.get("WEIGHTS") or cfg["weights"]
+        elif cfg.get("robust_ft") and os.environ.get("ROBUST_FT"):
+            weights = finetune_robust(cfg["robust_ft"], cfg["model"], outdir)
     sp = split_ids(coco, cfg["source_images"], seed=0)
     st = cfg["stream"]
     rng = np.random.RandomState(cfg["seed"])
@@ -783,7 +868,7 @@ def main():
     src_imgs, _, _ = build_frames(coco, root, [sp["source"]], ["clean"], 1, cfg["imgsz"], cfg["seed"])
     align_keys = [str(k) for k in cfg["taps"]]
     sig_keys = [str(k) for k in cfg.get("signal_taps", cfg["taps"])]
-    taps = Taps(det0, sorted(set(align_keys + sig_keys)))
+    taps = Taps(det0, sorted(set(align_keys + sig_keys + ([str(cfg["signal2"])] if cfg.get("signal2") else []))))
     B = cfg["batch"]
     per_img = {}  # key -> list of (per-channel mean, per-channel E[x^2]) per source image
     with torch.no_grad():
@@ -810,21 +895,27 @@ def main():
 
     N = len(src_imgs)
     src_stats = expected_stats(np.arange(N))
-    divs, raw = [], []
-    halves = np.array_split(g.permutation(N), 2)
-    for f in range(2):  # out-of-fold: stats from one half, signal on random batches of the other, smoothed like d_fast
-        ref = expected_stats(halves[1 - f], 1000)
-        df = None
-        for t in range(400):
-            st_ = batch_stats(g.choice(halves[f], B, replace=False))
-            d = divergence({k: st_[k] for k in sig_keys}, ref)
-            df = d if df is None else 0.7 * df + 0.3 * d
-            raw.append(d)
-            if t >= 3:
-                divs.append(df)
-    src_div = {f"q{q}": float(np.percentile(divs, q)) for q in (50, 90, 95, 99)}
-    src_div.update({f"rq{q}": float(np.percentile(raw, q)) for q in (50, 90, 99)})
-    log("source", images=len(src_imgs), **{k: round(v, 4) for k, v in src_div.items()})
+    def oof_div(keys):  # out-of-fold: stats from one half, signal on random batches of the other, smoothed like d_fast
+        divs, raw = [], []
+        halves = np.array_split(g.permutation(N), 2)
+        for f in range(2):
+            ref = expected_stats(halves[1 - f], 1000)
+            df = None
+            for t in range(400):
+                st_ = batch_stats(g.choice(halves[f], B, replace=False))
+                d = divergence({k: st_[k] for k in keys}, ref)
+                df = d if df is None else 0.7 * df + 0.3 * d
+                raw.append(d)
+                if t >= 3:
+                    divs.append(df)
+        out = {f"q{q}": float(np.percentile(divs, q)) for q in (50, 90, 95, 99)}
+        out.update({f"rq{q}": float(np.percentile(raw, q)) for q in (50, 90, 99)})
+        return out
+
+    src_div = oof_div(sig_keys)
+    if cfg.get("signal2"):
+        src_div["tap2"] = oof_div([str(cfg["signal2"])])
+    log("source", images=len(src_imgs), **{k: (round(v, 4) if isinstance(v, float) else {a: round(b, 4) for a, b in v.items()}) for k, v in src_div.items()})
     del src_imgs
     torch.save({"src_stats": src_stats, "src_div": src_div}, f"{outdir}/source_profile.pt")
 

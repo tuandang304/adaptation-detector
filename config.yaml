@@ -1,4 +1,4 @@
-# Round 7: P3 vs re-implemented forward-only baselines on several streams (shard env: STREAM, BATCH). val split, 1 seed.
+# Round 8: P4 = P3 + second routing tap (3.conv) for shifts invisible at conv0; robust source fine-tune (shard env: STREAM, WEIGHTS, AUGMIX, METHODS).
 model: yolo11n.pt
 imgsz: 640
 batch: 4
@@ -6,6 +6,9 @@ seed: 0
 source_images: 500
 taps: [4, 16, 19, 22]
 signal_taps: ["0.conv"]
+signal2: "3.conv"
+# robust_ft only runs when ROBUST_FT=1 (training shards); eval shards pass WEIGHTS=<pt>
+robust_ft: {epochs: 8, batch: 64, lr0: 0.002, augmix: 0.5, severity: 3}
 trigger_window: 15
 stream:
   split: val
@@ -28,6 +31,7 @@ methods:
   - {name: rdumb_250, bn_momentum: 0.05, bn_anchor: 0.01, reset_every: 250}
   - {name: ersk_style, bn_momentum: 0.05, bn_anchor: 0.01, cp_mode: zpeak, cp_z: 3.0, cp_cool: 8}
   - {<<: *P3, name: P3_dense}
+  - {<<: *P3, name: P4_dense, route2: true}
   - {<<: *P3, name: P3_b0.1_d30, bn_budget: 0.1, dense: 30}
   - {name: oracle_reset, bn_momentum: 0.05, bn_anchor: 0.01, oracle: true}
   - {name: frozen_end}
