@@ -39,5 +39,15 @@ methods:
   - {<<: *P3, name: R9_burst100, route2: true, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, schedule: trigger, cp_burst: 100, steady: false, anchor_w: 0.02}
   - {name: pl_always_anchor, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, anchor_w: 0.02}
   - {name: pl_always, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}}
+  # ---- R10 recent baselines re-implemented in this harness ("-style": adapted to an anchor-free YOLO head, BN-affine/adaptor params)
+  - {name: whw_lr1e-3, adapt: grad, adaptor: true, lr: 0.001, loss: {align: 1, obj: 1}, schedule: whw}
+  - {name: whw_lr1e-4, adapt: grad, adaptor: true, lr: 0.0001, loss: {align: 1, obj: 1}, schedule: whw}
+  - {name: whw_always_lr1e-3, adapt: grad, adaptor: true, lr: 0.001, loss: {align: 1, obj: 1}}
+  - {name: desa, adapt: grad, lr: 0.006, loss: {align: 0, pl: 1}, mt: desa}
+  - {name: desa_fast, adapt: grad, lr: 0.006, loss: {align: 0, pl: 1}, mt: desa, mt_pow: 10}
+  - {name: desa_fast_bn, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.006, loss: {align: 0, pl: 1}, mt: desa, mt_pow: 10}
+  - {name: amrod, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, mt: amrod, mt_ema: 0.999}
+  - {name: amrod_fast, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, mt: amrod, mt_ema: 0.99}
+  - {name: amrod_fast_bn, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, mt: amrod, mt_ema: 0.99}
   - {name: oracle_reset, bn_momentum: 0.05, bn_anchor: 0.01, oracle: true}
   - {name: frozen_end}

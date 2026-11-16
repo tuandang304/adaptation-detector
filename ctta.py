@@ -356,6 +356,33 @@ def divergence(stats, src):
     return float(sum(0.5 * (kl(m, v, *src[i]) + kl(*src[i], m, v)) for i, (m, v) in stats.items()) / len(stats))
 
 
+def obj_feats(outs, scores, keys, thr=0.25):
+    """Per detection scale: feature vectors at anchors whose top class score exceeds thr, with that class (WHW object-level features
+    for an anchor-free head: no RoIs, so confident anchor cells stand in for RoI-pooled features)."""
+    scores = torch.cat([z.flatten(2) for z in scores], 2) if isinstance(scores, list) else scores
+    p, c = scores.detach().sigmoid().max(1)
+    res, a0 = [], 0
+    for k in keys:
+        f = outs[k].flatten(2)
+        n = f.shape[2]
+        m = p[:, a0:a0 + n] > thr
+        res.append((f.permute(0, 2, 1)[m], c[:, a0:a0 + n][m]))
+        a0 += n
+    return res
+
+
+class Adaptor(nn.Module):
+    """WHW parallel adaptor: 1x1 down -> ReLU -> 1x1 up (zero-init), added to the block output."""
+
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.down, self.up = nn.Conv2d(cin, max(cin // 8, 8), 1), nn.Conv2d(max(cin // 8, 8), cout, 1)
+        nn.init.zeros_(self.up.weight); nn.init.zeros_(self.up.bias)
+
+    def forward(self, x):
+        return self.up(F.relu(self.down(x)))
+
+
 # ----------------------------------------------------------------------------- energy
 class Energy:
     """Cumulative GPU energy (J) from the NVML hardware counter; time-proportional proxy when no NVML (CPU smoke)."""
@@ -490,10 +517,29 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         mom = 1.0  # these modes update on every batch they are allowed to; `mom` only gates the update flag
     grad = mcfg.get("adapt", "none") == "grad"
     params = [p for b in adapt_bns for p in (b.weight, b.bias)] if grad else []
+    if mcfg.get("adaptor"):  # WHW: train only parallel adaptors on the backbone C3k2 blocks
+        params = []
+        for li in (2, 4, 6, 8):
+            blk = det.model[li]
+            with torch.no_grad():
+                xi = torch.zeros(1, 3, 64, 64, device=device)
+                io = {}
+                h_ = blk.register_forward_hook(lambda m_, i_, o_: io.update(cin=i_[0].shape[1], cout=o_.shape[1]))
+                det(xi); h_.remove()
+            ad = Adaptor(io["cin"], io["cout"]).to(device)
+            blk.register_forward_hook(lambda m_, i_, o_, ad=ad: o_ + ad(i_[0]))
+            params += list(ad.parameters())
     for p in params:
         p.requires_grad_(True)
     src_params = snapshot(params)
     opt = torch.optim.Adam(params, lr=mcfg.get("lr", 1e-4)) if grad else None
+    mt = mcfg.get("mt")                          # None | fixed | desa | amrod : mean teacher (model holds the teacher between steps)
+    mt_ema, mt_pow = mcfg.get("mt_ema", 0.999), mcfg.get("mt_pow", 1.0)
+    stu, nc_ = None, det.model[-1].nc
+    thr_c, l_ema = torch.full((nc_,), mcfg.get("pl_conf", 0.4), device=device), None  # AMROD class thresholds / score EMA
+    w_obj = mcfg.get("loss", {}).get("obj", 0.0)  # WHW class-wise object-level alignment
+    obj_mu, obj_n, whw_want, limg_s, limg_ema = None, torch.zeros(nc_, device=device), True, None, None
+    drift = lambda ps: float(sum((p_ - s0).abs().sum() / s0.abs().sum().clamp_min(1e-8) for p_, s0 in zip(ps, src_params)) / len(ps))
     w_align, w_ent = mcfg.get("loss", {}).get("align", 1.0), mcfg.get("loss", {}).get("ent", 0.0)
     w_pl = mcfg.get("loss", {}).get("pl", 0.0)  # pseudo-label self-training on a strong view (BN affine only)
     pl_conf, anchor_w = mcfg.get("pl_conf", 0.4), mcfg.get("anchor_w", 0.0)  # anchor_w: post-step pull of affine toward source
@@ -531,7 +577,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     dets_by_phase = [[] for _ in ids_by_phase]
     trace = {k: np.zeros(n_batches, np.float32) for k in ("div", "adapt", "want", "event", "bn_upd", "restore", "lat_ms", "energy_j")}
     need_sig = (cp_mode == "zpeak" or sched in ("trigger", "budget") or bn_gate == "ood" or bool(reset_after) or bool(cp_delta) or cp_mode == "dom") and not route
-    need_stats = need_sig or (grad and bool(w_align))
+    need_stats = need_sig or (grad and bool(w_align)) or sched == "whw"
     d = 0.0
     calm, burst_left, cool = 0, 0, 0
     budget = {}
@@ -606,6 +652,8 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             do = grad and want
         elif sched == "budget":
             do = grad and want and (replay is not None or bucket >= extra_est)
+        elif sched == "whw":  # WHW adaptation-on-demand, decided from the previous batch's image-level gap
+            do = grad and whw_want
         else:
             raise ValueError(sched)
         if route and w_pl:  # no self-training while the stream is routed to the source state
@@ -646,6 +694,20 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
                            for k, (m, v) in ast.items()}
                     loss = loss + w_align * sum(kl(m, v, *src_stats[k]) for k, (m, v) in cur.items()) / len(cur)
                     ema_stats = {k: (m.detach(), v.detach()) for k, (m, v) in cur.items()}
+                if w_obj:
+                    for si, (f_, c_) in enumerate(obj_feats(taps.out, raw["scores"], align_keys[1:])):
+                        mu_s, var_s, n_s = src_stats["obj"][si]
+                        if obj_mu is None:
+                            obj_mu = [m_.clone() for m_, _, _ in src_stats["obj"]]
+                        if si == 0:
+                            obj_n += torch.bincount(c_, minlength=nc_)
+                        for k_ in c_.unique().tolist():
+                            if n_s[k_] < 5:
+                                continue
+                            mk = (1 - alpha) * obj_mu[si][k_] + alpha * f_[c_ == k_].mean(0)
+                            wk = float(torch.log(obj_n.max() / obj_n[k_].clamp_min(1))) + 0.01
+                            loss = loss + w_obj * wk * 0.5 * ((mk - mu_s[k_]) ** 2 / var_s[k_]).mean() / 3
+                            obj_mu[si][k_] = mk.detach()
                 if w_ent:
                     s = torch.cat([z.flatten(2) for z in raw["scores"]], 2) if isinstance(raw["scores"], list) else raw["scores"]
                     p = s.sigmoid().amax(1)  # [B, anchors] max class prob
@@ -661,8 +723,28 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
                              for k, (m, v) in ast.items()}
 
         if do and w_pl:  # this batch's own detections supervise a strongly augmented view of the same batch
-            pl = non_max_suppression(y.detach(), conf_thres=pl_conf, iou_thres=0.7, max_det=50)
-            if sum(len(o) for o in pl) and not all(b.use_src for b in bns):  # a source-routed batch has nothing to train
+            go = True
+            if mt == "amrod":  # adaptive monitoring: class-wise thresholds + skip when the mean score jumps
+                pl = non_max_suppression(y.detach(), conf_thres=0.05, iou_thres=0.7, max_det=50)
+                allp = torch.cat(pl)
+                if len(allp):
+                    l_t = float(allp[:, 4].mean())
+                    go = l_ema is None or (1 / 1.3 < l_t / l_ema < 1.3)
+                    l_ema = l_t if l_ema is None else 0.75 * l_ema + 0.25 * l_t
+                    for k_ in allp[:, 5].unique().long().tolist():
+                        thr_c[k_] = (0.95 * thr_c[k_] + 0.05 * 1.3 * allp[allp[:, 5] == k_, 4].mean().sqrt()).clamp(0.25, 0.8)
+                pl = [o[o[:, 4] >= thr_c[o[:, 5].long()]] for o in pl]
+            else:
+                pl = non_max_suppression(y.detach(), conf_thres=pl_conf, iou_thres=0.7, max_det=50)
+            if mt and since_reset == 0:
+                stu = snapshot(params)  # a source reset restarts the student too
+            do = go and sum(len(o) for o in pl) > 0 and not all(b.use_src for b in bns)  # a source-routed batch has nothing to train
+            if do:
+                if mt:
+                    tea = snapshot(params)
+                    with torch.no_grad():
+                        for p_, v_ in zip(params, stu):
+                            p_.copy_(v_)
                 state["hold"] = True  # keep this batch's routing; the strong view must not touch BN statistics
                 for b in bns:
                     b.update = False
@@ -682,11 +764,39 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
                     opt.step()
-                if anchor_w:
-                    with torch.no_grad():
+                with torch.no_grad():
+                    a_ = anchor_w
+                    if mt == "desa":  # drift-dependent source anchoring (DESA-TTA eq. 7-9)
+                        ds = drift(params)
+                        a_ = 0.035 * ds ** 2 / (ds ** 2 + 0.07 ** 2)
+                    if a_:
                         for p_, s0 in zip(params, src_params):
-                            p_.lerp_(s0, anchor_w)
+                            p_.lerp_(s0, a_)
+                    if mt == "amrod":  # adaptive randomized restoration: low Fisher x random -> back to source, per tensor
+                        for p_, s0 in zip(params, src_params):
+                            w_ = p_.grad ** 2 * torch.rand_like(p_)
+                            mk = w_ < torch.quantile(w_.flatten(), mcfg.get("arr_q", 0.01))
+                            p_[mk] = s0[mk]
+                    if mt:
+                        stu = snapshot(params)
+                        m_ = mt_ema
+                        if mt == "desa":  # dynamic EMA from teacher uncertainty within a teacher-drift-dependent range (eq. 4-6)
+                            sc = torch.cat([o[:, 4] for o in pl])
+                            r_ = min(len(sc) / len(pl) / 300 * -float(sc.mean().log()), 1.0)
+                            dt = drift(tea)
+                            lo = 0.9990 - 0.0060 * (1 - dt ** 2 / (dt ** 2 + 0.036 ** 2))
+                            hi = 0.9996 - 0.0016 * (1 - dt ** 2 / (dt ** 2 + 0.021 ** 2))
+                            m_ = hi - (hi - lo) * r_
+                        m_ = m_ ** mt_pow
+                        for p_, t_, v_ in zip(params, tea, stu):
+                            p_.copy_(m_ * t_ + (1 - m_) * v_)
                 state["hold"] = False
+
+        if sched == "whw":  # criterion 1: gap above the in-domain gap; criterion 2: gap rising against its own EMA
+            li = divergence({k: (m.detach(), v.detach()) for k, (m, v) in st.items() if k in align_keys}, src_stats)
+            limg_s = li if limg_s is None else (1 - alpha) * limg_s + alpha * li
+            whw_want = limg_s / src_div["align_q50"] > mcfg.get("tau1", 1.1) or (limg_ema is not None and limg_s / limg_ema > mcfg.get("tau2", 1.05))
+            limg_ema = limg_s if limg_ema is None else 0.99 * limg_ema + 0.01 * limg_s
 
         # ---- signal bookkeeping: fast/slow EMAs, change-point events, clean-return restoration
         d_fast = d if d_fast is None else 0.7 * d_fast + 0.3 * d
@@ -912,9 +1022,15 @@ def main():
     taps = Taps(det0, sorted(set(align_keys + sig_keys + ([str(cfg["signal2"])] if cfg.get("signal2") else []))))
     B = cfg["batch"]
     per_img = {}  # key -> list of (per-channel mean, per-channel E[x^2]) per source image
+    obj_acc, nc0 = [], det0.model[-1].nc  # per scale: class-wise sum, sum of squares, count of confident anchor features
     with torch.no_grad():
         for k in range(0, len(src_imgs), B):
-            det0(torch.from_numpy(src_imgs[k:k + B]).to(device).permute(0, 3, 1, 2).float().div_(255))
+            _, raw0 = det0(torch.from_numpy(src_imgs[k:k + B]).to(device).permute(0, 3, 1, 2).float().div_(255))
+            for si, (f_, c_) in enumerate(obj_feats(taps.out, raw0["scores"], align_keys[1:])):
+                if len(obj_acc) <= si:
+                    obj_acc.append([torch.zeros(nc0, f_.shape[1], device=device, dtype=torch.double) for _ in range(2)] + [torch.zeros(nc0, device=device, dtype=torch.double)])
+                obj_acc[si][0].index_add_(0, c_, f_.double()); obj_acc[si][1].index_add_(0, c_, f_.double() ** 2)
+                obj_acc[si][2] += torch.bincount(c_, minlength=nc0)
             for key, o in taps.out.items():
                 per_img.setdefault(key, []).append(torch.stack([o.mean((2, 3)), (o ** 2).mean((2, 3))], 1).double().cpu())
     taps.remove()
@@ -954,9 +1070,12 @@ def main():
         return out
 
     src_div = oof_div(sig_keys)
+    src_div["align_q50"] = oof_div(align_keys)["q50"]  # in-domain image-level gap (WHW criterion 1)
     if cfg.get("signal2"):
         src_div["tap2"] = oof_div([str(cfg["signal2"])])
     log("source", images=len(src_imgs), **{k: (round(v, 4) if isinstance(v, float) else {a: round(b, 4) for a, b in v.items()}) for k, v in src_div.items()})
+    src_stats["obj"] = [((s1 / n.clamp_min(1)[:, None]).float(), (s2 / n.clamp_min(1)[:, None] - (s1 / n.clamp_min(1)[:, None]) ** 2).clamp_min(1e-3).float(), n)
+                        for s1, s2, n in obj_acc]
     del src_imgs
     torch.save({"src_stats": src_stats, "src_div": src_div}, f"{outdir}/source_profile.pt")
 
