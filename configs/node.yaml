@@ -1,4 +1,4 @@
-# Stock YOLO26n fine-tuned from its COCO checkpoint with the fixed screening recipe, BDD100K daytime+clear only.
+# YOLO26n + mix, cons, fine-tuned from the COCO checkpoint with the fixed screening recipe, BDD100K daytime+clear only.
 smoke: false
 data_dir: /tmp/bench_data
 model: yolo26n
@@ -7,7 +7,7 @@ imgsz: 640
 seed: 0
 eval_splits: [valid, night, nightrain, duskrain, dayrain]   # real conditions unseen in training
 shift_eval: false      # real shifted sets instead of synthetic degradations
-mods: []               # stock model
+mods: [mix, cons]
 # one list per GPU, trained in order; on a single-GPU host the lists run one after another
 gpu_plan: [[bdd]]
 # written out instead of optimizer=auto so that every dataset gets the same optimizer whatever its iteration count
