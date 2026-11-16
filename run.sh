@@ -3,7 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 # GITHUB_ACTIONS=1 makes Ultralytics 8.4 refresh its progress bar once per 60 s instead of per batch
-export PYTHONUNBUFFERED=1 MPLBACKEND=Agg YOLO_OFFLINE=0 GITHUB_ACTIONS=1
+# TQDM_DISABLE=1 silences the kagglehub download bars (one line per 5 MB otherwise)
+export PYTHONUNBUFFERED=1 MPLBACKEND=Agg YOLO_OFFLINE=0 GITHUB_ACTIONS=1 TQDM_DISABLE=1
 python -m pip install -q --disable-pip-version-check -r requirements-run.txt
 export ORX_OUTPUT_DIR="${ORX_OUTPUT_DIR:-$PWD/outputs}"
 mkdir -p "$ORX_OUTPUT_DIR"
