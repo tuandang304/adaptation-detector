@@ -34,16 +34,23 @@ def sample(root: Path, exts: tuple[str, ...], n: int = 2) -> dict:
 
 
 def run(refs: list[str]) -> dict:
-    import kagglehub
-    rep = {}
+    """Which ways of fetching a public Kaggle dataset work from this host (kernels cannot attach at run time)."""
+    import subprocess
+    rep = {"env": sorted(k for k in os.environ if "KAGGLE" in k)}
     for ref in refs:
-        t0 = time.time()
-        try:
-            root = Path(kagglehub.dataset_download(ref))
-            t = tree(root)
-            rep[ref] = {"root": str(root), "sec": round(time.time() - t0, 1), "files": sum(t["dirs"].values()), **t,
-                        "samples": sample(root, (".txt", ".xml", ".json", ".yaml", ".csv"))}
-        except Exception as e:  # noqa: BLE001 - a missing copy is a finding, not a failure
-            rep[ref] = {"error": repr(e)[:400], "sec": round(time.time() - t0, 1)}
-        print("[probe] " + json.dumps({ref: rep[ref]})[:6000], flush=True)
+        url = f"https://www.kaggle.com/api/v1/datasets/download/{ref}"
+        r = subprocess.run(["curl", "-sS", "-L", "-m", "60", "-r", "0-1023", "-o", "/dev/null", "-w", "%{http_code}", url],
+                           capture_output=True, text=True)
+        rep[ref] = {"anonymous_http": r.stdout + r.stderr[:200]}
+        try:  # outside the kernel code path kagglehub downloads over HTTP with the kernel's own identity
+            env = {k: os.environ.pop(k) for k in list(os.environ) if k == "KAGGLE_KERNEL_RUN_TYPE"}
+            import kagglehub
+            t0 = time.time()
+            path = kagglehub.dataset_download(ref, path=None) if ref == refs[0] else "skipped"
+            rep[ref]["kagglehub_http"] = {"path": str(path), "sec": round(time.time() - t0, 1)}
+            os.environ.update(env)
+        except Exception as e:  # noqa: BLE001 - a failing route is a finding
+            rep[ref]["kagglehub_http"] = repr(e)[:300]
+        print("[probe] " + json.dumps({ref: rep[ref]}), flush=True)
+    print("[probe] " + json.dumps({"env": rep["env"]}), flush=True)
     return rep

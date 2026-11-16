@@ -42,7 +42,7 @@ class YoloPredictor:
         for i in range(0, len(paths), batch):
             chunk = paths[i:i + batch]
             res = self.model.predict(chunk, imgsz=imgsz, conf=conf, iou=0.7, max_det=max_det, device=self.device,
-                                     half=self.half, verbose=False)
+                                     verbose=False, **({"half": True} if self.half else {}))  # half=False still warns per call
             for p, r in zip(chunk, res):
                 b = r.boxes
                 cls = b.cls.cpu().numpy().astype(int)

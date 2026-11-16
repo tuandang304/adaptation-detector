@@ -31,6 +31,9 @@ def latency(pred, image_path: str, imgsz: int, n_warm: int = 30, n_iter: int = 2
     from PIL import Image
     im = np.asarray(Image.open(image_path).convert("RGB"))
     call = lambda: pred.model.predict(im[..., ::-1], imgsz=imgsz, conf=0.25, half=True, device=0, verbose=False)
+    from ultralytics.utils import LOGGER
+    level = LOGGER.level
+    LOGGER.setLevel("ERROR")  # 'half' prints a deprecation warning on each of the 230 calls
     for _ in range(n_warm):
         call()
     torch.cuda.synchronize()
@@ -40,5 +43,6 @@ def latency(pred, image_path: str, imgsz: int, n_warm: int = 30, n_iter: int = 2
         call()
         torch.cuda.synchronize()
         ts.append((time.perf_counter() - t) * 1e3)
+    LOGGER.setLevel(level)
     return {f"e2e_ms@{imgsz}_median": round(float(np.median(ts)), 2), f"e2e_ms@{imgsz}_p90": round(float(np.percentile(ts, 90)), 2),
             "gpu": torch.cuda.get_device_name(0), "precision": "fp16", "batch": 1}
