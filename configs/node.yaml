@@ -9,6 +9,6 @@ eval_splits: [valid]   # test splits stay closed during screening
 shift_eval: true       # also score val under four fixed degradations (dark, haze, noise, blur)
 mods: [mix, cons]
 # one list per GPU, trained in order; on a single-GPU host the lists run one after another
-gpu_plan: [[ruod], [visdrone, cityscapes, exdark]]
+gpu_plan: [[ruod], [cityscapes, exdark]]   # VisDrone dropped from screening (no real shifted pair)
 # written out instead of optimizer=auto so that every dataset gets the same optimizer whatever its iteration count
 extra: {optimizer: MuSGD, lr0: 0.01, lrf: 0.01, momentum: 0.9, warmup_bias_lr: 0.0}
