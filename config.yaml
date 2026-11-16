@@ -43,6 +43,11 @@ methods:
   - {name: whw_lr1e-3, adapt: grad, adaptor: true, lr: 0.001, loss: {align: 1, obj: 1}, schedule: whw}
   - {name: whw_lr1e-4, adapt: grad, adaptor: true, lr: 0.0001, loss: {align: 1, obj: 1}, schedule: whw}
   - {name: whw_always_lr1e-3, adapt: grad, adaptor: true, lr: 0.001, loss: {align: 1, obj: 1}}
+  - {name: whw_img_lr1e-4, adapt: grad, adaptor: true, lr: 0.0001, loss: {align: 1, obj: 0}, schedule: whw}
+  - {name: whw_obj_lr1e-4, adapt: grad, adaptor: true, lr: 0.0001, loss: {align: 0, obj: 1}, schedule: whw}
+  - {name: whw_lr1e-5, adapt: grad, adaptor: true, lr: 0.00001, loss: {align: 1, obj: 1}, schedule: whw}
+  - {name: whw_obj_lr1e-5, adapt: grad, adaptor: true, lr: 0.00001, loss: {align: 0, obj: 1}, schedule: whw}
+  - {name: whw_bn_obj_lr1e-5, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, adaptor: true, lr: 0.00001, loss: {align: 0, obj: 1}}
   - {name: desa, adapt: grad, lr: 0.006, loss: {align: 0, pl: 1}, mt: desa}
   - {name: desa_fast, adapt: grad, lr: 0.006, loss: {align: 0, pl: 1}, mt: desa, mt_pow: 10}
   - {name: desa_fast_bn, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.006, loss: {align: 0, pl: 1}, mt: desa, mt_pow: 10}

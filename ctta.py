@@ -167,9 +167,10 @@ def finetune_robust(ft, base_weights, outdir):
     class Trainer(DetectionTrainer):
         def preprocess_batch(self, batch):
             img = batch["img"].to(self.device)  # uint8; chunks of 8 share one sampled op chain
-            for k in range(0, len(img), 8):
+            ch = len(img) if os.environ.get("HOMOG") else 8  # HOMOG: one style per batch, so train-mode BN statistics carry the domain
+            for k in range(0, len(img), ch):
                 if np.random.rand() < p_aug:
-                    img[k:k + 8] = aug(img[k:k + 8])
+                    img[k:k + ch] = aug(img[k:k + ch])
             batch["img"] = img
             return super().preprocess_batch(batch)
 
