@@ -8,6 +8,12 @@ Every change leaves the network equal to the pretrained one at step 0 (new branc
         the deviation of stem feature statistics from their training-time reference, one forward pass, no gradient
   mix   training only: per-sample feature statistics of L1 and L3 are mixed with another sample of the batch
   cons  training only: a photometrically jittered second view must give the same Detect input features
+  align first-layer features are re-aligned per image to their training-time reference through a per-channel gate
+  lowpass  before the stride-2 stem convs (L0, L1, L3) the input is blended with a 3x3 low-pass copy; the strength
+        grows with the image's excess high-frequency energy over the training reference (3 parameters)
+  restore  training only, the signal for film / align / lowpass: a perturbed copy goes through the stem (L0-L3) with
+        the stem weights detached and BatchNorm in eval mode, and must give the clean stem output; only the new
+        modules receive this gradient. Perturbation: Gaussian noise if lowpass is on, photometric jitter otherwise
 
 Hooks are module-level callables so that checkpoints (pickled models) and the EMA deep copy keep them.
 """
@@ -105,6 +111,71 @@ def add_film(model: nn.Module) -> None:
         model.model[i].register_forward_hook(FilmHook(model.film, k))
 
 
+# --- align ------------------------------------------------------------------------------------------------------
+class Align(nn.Module):
+    """Forward hook on L0: x + g * (x re-standardised to the training reference - x), g = 0 at step 0."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.register_buffer("ref_mu", torch.zeros(1, c, 1, 1))
+        self.register_buffer("ref_sd", torch.ones(1, c, 1, 1))
+        self.register_buffer("seen", torch.zeros(()))
+        self.g = nn.Parameter(torch.zeros(1, c, 1, 1))
+
+    def forward(self, module, inputs, out):
+        x = out.float()
+        mu, sd = x.mean((2, 3), keepdim=True), x.std((2, 3), keepdim=True) + 1e-3
+        if self.training:
+            with torch.no_grad():
+                m = 1.0 if self.seen == 0 else 0.01
+                self.ref_mu.lerp_(mu.mean(0, keepdim=True), m)
+                self.ref_sd.lerp_(sd.mean(0, keepdim=True), m)
+                self.seen.fill_(1)
+        # clones: the next training forward updates the references in place
+        return (x + self.g.float() * ((x - mu) / sd * self.ref_sd.clone() + self.ref_mu.clone() - x)).to(out.dtype)
+
+
+def add_align(model: nn.Module) -> None:
+    model.align = Align(model.model[0].conv.out_channels)
+    model.model[0].register_forward_hook(model.align)
+
+
+# --- lowpass ----------------------------------------------------------------------------------------------------
+class LowPass(nn.Module):
+    def __init__(self, n: int):
+        super().__init__()
+        self.register_buffer("ref", torch.zeros(()))
+        self.w = nn.Parameter(torch.zeros(n))
+        self.dev = None  # per-forward state, cleared by the last hooked layer
+
+    def blend(self, k: int, x: torch.Tensor) -> torch.Tensor:
+        if k == 0:
+            xf = x.float()
+            hf = (xf - F.avg_pool2d(xf, 3, 1, 1, count_include_pad=False)).abs().mean((1, 2, 3))
+            if self.training:
+                with torch.no_grad():
+                    self.ref.lerp_(hf.mean(), 1.0 if self.ref == 0 else 0.01)
+            self.dev = F.relu(hf / (self.ref + 1e-6) - 1)
+        a = torch.tanh(self.w[k] * self.dev)[:, None, None, None].to(x.dtype)
+        if k == len(self.w) - 1:
+            self.dev = None
+        return x + a * (F.avg_pool2d(x, 3, 1, 1, count_include_pad=False) - x)
+
+
+class LowHook:
+    def __init__(self, lp: LowPass, k: int):
+        self.lp, self.k = lp, k
+
+    def __call__(self, module, inputs):
+        return (self.lp.blend(self.k, inputs[0]),)
+
+
+def add_lowpass(model: nn.Module) -> None:
+    model.lowpass = LowPass(len(FILM_LAYERS))
+    for k, i in enumerate(FILM_LAYERS):
+        model.model[i].register_forward_pre_hook(LowHook(model.lowpass, k))
+
+
 # --- mix ---------------------------------------------------------------------------------------------------------
 class MixStat:
     """MixStyle-type mixing of per-sample channel statistics; identity in eval mode."""
@@ -146,18 +217,42 @@ def style_jitter(img: torch.Tensor) -> torch.Tensor:
 
 
 class ConsistModel(DetectionModel):
-    cons_weight = 1.0
+    cons_weight = restore_weight = 1.0
+
+    def restore_loss(self, img: torch.Tensor) -> torch.Tensor:
+        stem = self.model[:4]
+        parts = [stem] + [getattr(self, n) for n in ("film", "align", "lowpass") if hasattr(self, n)]
+        for m in parts:  # eval: BatchNorm as at inference, no mixing, references not updated
+            m.eval()
+        try:
+            with torch.no_grad():
+                target = stem(img).float()
+            view = img.float()
+            if hasattr(self, "lowpass"):
+                view = view + torch.randn_like(view) * torch.empty(len(view), 1, 1, 1, device=view.device).uniform_(0, 0.1)
+            else:
+                view = style_jitter(view)
+            frozen = {k: v.detach() for k, v in stem.named_parameters()}
+            out = torch.func.functional_call(stem, frozen, (view.clamp(0, 1).to(img.dtype),)).float()
+        finally:
+            for m in parts:
+                m.train()
+        return F.mse_loss(out, target) / (target.var() + 1e-6)
 
     def loss(self, batch, preds=None):
         loss, items = super().loss(batch, preds)
         if not self.training or preds is not None:
             return loss, items
-        f1, self.tap.feats = self.tap.feats, None
-        self.forward(style_jitter(batch["img"]))
-        f2, self.tap.feats = self.tap.feats, None
-        c = sum(1 - F.cosine_similarity(a.detach().float(), b.float(), dim=1).mean() for a, b in zip(f1, f2)) / len(f1)
-        # the trainer sums the loss vector, which is already scaled by the batch size
-        return loss + self.cons_weight * c * batch["img"].shape[0] / loss.numel(), items
+        scale = batch["img"].shape[0] / loss.numel()  # the trainer sums the loss vector, already scaled by the batch size
+        if hasattr(self, "tap"):
+            f1, self.tap.feats = self.tap.feats, None
+            self.forward(style_jitter(batch["img"]))
+            f2, self.tap.feats = self.tap.feats, None
+            c = sum(1 - F.cosine_similarity(a.detach().float(), b.float(), dim=1).mean() for a, b in zip(f1, f2)) / len(f1)
+            loss = loss + self.cons_weight * c * scale
+        if getattr(self, "restore", False):
+            loss = loss + self.restore_weight * self.restore_loss(batch["img"]) * scale
+        return loss, items
 
 
 def add_cons(model: nn.Module) -> None:
@@ -166,7 +261,13 @@ def add_cons(model: nn.Module) -> None:
     model.model[-1].register_forward_pre_hook(model.tap)
 
 
-ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons}
+def add_restore(model: nn.Module) -> None:
+    model.__class__ = ConsistModel
+    model.restore = True
+
+
+ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons, "align": add_align,
+       "lowpass": add_lowpass, "restore": add_restore}
 
 
 def apply(model: nn.Module, mods: list[str]) -> nn.Module:
@@ -232,4 +333,16 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     loss.sum().backward()
     assert m.tap.feats is None and m.film.ab is None
     assert all(p.grad is not None for p in m.film.parameters()), "film received no gradient"
+    for mods, new in ((["film", "restore"], "film"), (["align", "restore"], "align"), (["lowpass", "restore"], "lowpass")):
+        r = apply(copy.deepcopy(base), mods)  # restore alone must reach the new module and nothing in the stem
+        assert torch.allclose(r.eval()(x)[0], ref, atol=1e-4), f"{mods} not identical at step 0"
+        r.train()
+        for p in r.parameters():
+            p.requires_grad_(True)
+        if new == "film":  # the last film layer is zero, so nothing upstream of it has a gradient yet
+            nn.init.normal_(r.film.net[2].weight, std=0.05)
+        r.restore_loss(x).backward()
+        got = {n for n, p in r.named_parameters() if p.grad is not None and p.grad.abs().sum() > 0}
+        assert got and all(n.startswith(new) for n in got), (mods, sorted(got)[:5])
+        assert getattr(r, "film", r).training and r.model[0].training
     print("mods self-check ok", SimpleNamespace(loss=float(loss.sum())))
