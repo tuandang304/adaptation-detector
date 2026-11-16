@@ -1,4 +1,4 @@
-# Round 6: P-v3 (routing hysteresis + burst-then-ration Joule budget) vs R4 controls. COCO-C val, 1 seed.
+# Round 7: P3 vs re-implemented forward-only baselines on several streams (shard env: STREAM, BATCH). val split, 1 seed.
 model: yolo11n.pt
 imgsz: 640
 batch: 4
@@ -13,17 +13,21 @@ stream:
   per_phase: 500
   severity: 5
   same_clean_ids: true
-P2: &P2 {bn_momentum: 0.05, bn_anchor: 0.01, route: true, cp_mode: dom, cp_z: 3.0, cp_persist: 2, cp_cool: 8, reset_on_shift: true}
+streams:
+  cyc7: {}
+  longclean: {per_phase: 200, phases: [clean, clean, fog, clean, clean, gaussian_noise, clean, clean, motion_blur, clean, clean, snow, clean, clean, contrast, clean, clean]}
+  heldout: {per_phase: 440, phases: [clean, defocus_blur, frost, jpeg_compression, brightness, pixelate, shot_noise, clean]}
 P3: &P3 {bn_momentum: 0.05, bn_anchor: 0.01, route: true, route_hyst: true, route_low_q: rq90, cp_mode: dom, cp_z: 3.0, cp_persist: 2, cp_cool: 8, reset_on_shift: true}
 methods:
   - {name: frozen}
   - {name: bnema_always, bn_momentum: 0.05, bn_anchor: 0.01}
-  - {<<: *P2, name: P2_dense}
+  - {name: norm_prior0.8, bn_mode: norm, bn_prior: 0.8}
+  - {name: dua, bn_momentum: 0.1, bn_mom_decay: 0.94, bn_mom_min: 0.005}
+  - {name: artta_style, bn_mode: artta, bn_gamma: 10.0}
+  - {name: mecta_norm_style, bn_mode: mecta}
+  - {name: rdumb_250, bn_momentum: 0.05, bn_anchor: 0.01, reset_every: 250}
+  - {name: ersk_style, bn_momentum: 0.05, bn_anchor: 0.01, cp_mode: zpeak, cp_z: 3.0, cp_cool: 8}
   - {<<: *P3, name: P3_dense}
-  - {<<: *P3, name: P3_dense_low50, route_low_q: rq50}
-  - {<<: *P3, name: P3_dense_m0.1, bn_momentum: 0.1}
-  - {<<: *P3, name: P3_b0.25_d30, bn_budget: 0.25, dense: 30}
   - {<<: *P3, name: P3_b0.1_d30, bn_budget: 0.1, dense: 30}
-  - {<<: *P3, name: P3_b0.1_d20, bn_budget: 0.1, dense: 20}
-  - {<<: *P3, name: P3_b0.05_d30, bn_budget: 0.05, dense: 30}
+  - {name: oracle_reset, bn_momentum: 0.05, bn_anchor: 0.01, oracle: true}
   - {name: frozen_end}

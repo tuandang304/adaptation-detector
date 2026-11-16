@@ -192,10 +192,26 @@ class AdaBN(nn.Module):
         self.register_buffer("src_mean", bn.running_mean.clone())
         self.register_buffer("src_var", bn.running_var.clone())
         self.momentum, self.anchor, self.update, self.use_src = 0.0, 0.0, False, False
+        self.mode, self.prior, self.gamma, self.beta = "ema", 0.8, 10.0, 0.0  # baseline re-implementations, see forward
 
     def forward(self, x):
         if self.use_src:  # routed to the untouched source statistics for this batch
             return F.batch_norm(x, self.src_mean, self.src_var, self.weight, self.bias, False, 0.0, self.eps)
+        if self.mode != "ema" and self.update:  # forward-only baselines that need this batch's statistics
+            with torch.no_grad():
+                bv, bm = torch.var_mean(x.detach(), dim=(0, 2, 3), correction=0)
+                skl = lambda m1, v1, m2, v2: float(0.5 * (kl(m1, v1, m2, v2) + kl(m2, v2, m1, v1)))
+                if self.mode == "norm":      # Schneider et al. 2020: source prior N vs test batch n -> fixed source weight
+                    w = self.prior
+                elif self.mode == "artta":   # AR-TTA-style: source/batch mixing weight from their symmetric KL, EMA-smoothed
+                    self.beta = 0.95 * self.beta + 0.05 * (1 - float(np.exp(-self.gamma * skl(self.src_mean, self.src_var, bm, bv))))
+                    w = 1 - self.beta
+                else:                        # MECTA-norm-style: forget gate from KL(running, batch) on the running stats
+                    g = 1 - float(np.exp(-skl(self.running_mean, self.running_var, bm, bv)))
+                    self.running_mean.mul_(1 - g).add_(bm, alpha=g); self.running_var.mul_(1 - g).add_(bv, alpha=g)
+                    return F.batch_norm(x, self.running_mean, self.running_var, self.weight, self.bias, False, 0.0, self.eps)
+                mean, var = w * self.src_mean + (1 - w) * bm, w * self.src_var + (1 - w) * bv
+            return F.batch_norm(x, mean, var, self.weight, self.bias, False, 0.0, self.eps)
         if self.update and self.momentum > 0:
             with torch.no_grad():
                 m, a = self.momentum, self.anchor
@@ -401,6 +417,13 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     mom = mcfg.get("bn_momentum", 0.0)
     for b in bns:
         b.momentum, b.anchor = mom, mcfg.get("bn_anchor", 0.0)
+        b.mode, b.prior, b.gamma, b.beta = mcfg.get("bn_mode", "ema"), mcfg.get("bn_prior", 0.8), mcfg.get("bn_gamma", 10.0), 0.0
+    mom_decay, mom_min = mcfg.get("bn_mom_decay", 0.0), mcfg.get("bn_mom_min", 0.005)   # DUA momentum schedule
+    reset_every = mcfg.get("reset_every", 0)     # RDumb: restore source every K batches
+    oracle = mcfg.get("oracle", False)           # upper bound: knows phase boundaries and which phases are clean
+    since_reset, zhist = 0, []
+    if mcfg.get("bn_mode", "ema") != "ema":
+        mom = 1.0  # these modes update on every batch they are allowed to; `mom` only gates the update flag
     grad = mcfg.get("adapt", "none") == "grad"
     params = [p for b in adapt_bns for p in (b.weight, b.bias)] if grad else []
     for p in params:
@@ -436,7 +459,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     ema_stats, d_fast, d_slow = None, None, None
     dets_by_phase = [[] for _ in ids_by_phase]
     trace = {k: np.zeros(n_batches, np.float32) for k in ("div", "adapt", "want", "event", "bn_upd", "restore", "lat_ms", "energy_j")}
-    need_sig = (sched in ("trigger", "budget") or bn_gate == "ood" or bool(reset_after) or bool(cp_delta) or cp_mode == "dom") and not route
+    need_sig = (cp_mode == "zpeak" or sched in ("trigger", "budget") or bn_gate == "ood" or bool(reset_after) or bool(cp_delta) or cp_mode == "dom") and not route
     need_stats = need_sig or (grad and bool(w_align))
     d = 0.0
     calm, burst_left, cool = 0, 0, 0
@@ -496,6 +519,16 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         else:
             raise ValueError(sched)
         upd = mom > 0 and (bn_gate == "always" or ood)
+        if mom_decay:
+            for b in bns:
+                b.momentum = max(mom * mom_decay ** since_reset, mom_min)
+        if oracle:
+            ph = meta[sl.start][0]
+            if t and meta[sl.start - 1][0] != ph:
+                restore_source(params, src_params, bns, opt)
+            upd = cfg["stream"]["phases"][ph] != "clean"
+            for b in bns:
+                b.use_src = not upd
         if replay is not None:
             do, upd = bool(replay["adapt"][t]), bool(replay["bn_upd"][t])
         if route:  # the hook decides routing/update inside the forward; here only whether an update is affordable
@@ -544,6 +577,13 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             if replay["restore"][t]:
                 restore_source(params, src_params, bns, opt)
                 ema_stats = None
+        elif cp_mode == "zpeak":  # ERSK-style: z-score peak of the KL signal over a sliding window -> reset to source
+            if len(zhist) >= 10 and (d - np.mean(zhist)) / (np.std(zhist) + 1e-8) > cp_z and cool == 0:
+                event, cool, zhist = True, cp_cool, []
+                restore_source(params, src_params, bns, opt)
+                ema_stats, restored = None, True
+            else:
+                zhist = (zhist + [d])[-30:]
         elif cp_mode == "dom":
             cs = state["stats"] if route else tuple(x_.detach() for x_ in st[sig_key])
             dd = 0.5 * (float(kl(*cs, *cp_ref)) + float(kl(*cp_ref, *cs)))
@@ -566,6 +606,10 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             if reset_on_shift:
                 restore_source(params, src_params, bns, opt)
                 ema_stats, restored = None, True
+        if reset_every and replay is None and (t + 1) % reset_every == 0:
+            restore_source(params, src_params, bns, opt)
+            restored = True
+        since_reset = 0 if (restored or (replay is not None and replay["restore"][t])) else since_reset + 1
         if reset_after and replay is None:
             calm = calm + 1 if d_fast < tau_lo else 0
             if calm == reset_after:
@@ -636,10 +680,11 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     shift = [i for i, n in enumerate(phases) if n != "clean"]
     res = {"method": name, "map50_shift": np.mean([ev[i][1] for i in shift]), "map_shift": np.mean([ev[i][0] for i in shift]),
            "map50_clean_first": ev[0][1], "map50_clean_last": ev[-1][1],
+           "map50_clean_mean": np.mean([ev[i][1] for i, n in enumerate(phases) if n == "clean"]),
            "map50_by_phase": {f"{i}:{n}": round(ev[i][1], 4) for i, n in enumerate(phases)},
            "adapt_steps": int(trace["adapt"].sum()), "adapt_frac": float(trace["adapt"].mean()), "bn_upd_frac": float(trace["bn_upd"].mean()),
            "eval_pass": {k: round(v, 3) if isinstance(v, float) else v for k, v in cost.items()}, "secs": round(wall, 1), **budget}
-    if cp_delta or cp_mode == "dom":
+    if cp_delta or cp_mode in ("dom", "zpeak"):
         res.update(trigger_metrics(trace, meta, B, phases, cfg.get("trigger_window", 15)))
     np.savez_compressed(f"{outdir}/trace_{name}.npz", **trace)
     with open(f"{outdir}/dets_{name}.json", "w") as f:
@@ -672,6 +717,11 @@ def main():
     ap.add_argument("--config", default="config.yaml")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
+    if os.environ.get("STREAM"):  # shard-level stream choice from cfg["streams"]
+        cfg["stream"].update(cfg["streams"][os.environ["STREAM"]])
+        cfg["stream_name"] = os.environ["STREAM"]
+    if os.environ.get("BATCH"):
+        cfg["batch"] = int(os.environ["BATCH"])
     if os.environ.get("RECAL_BN") is not None:  # shard-level override so one commit can run with/without recalibration
         cfg["recal_bn"] = int(os.environ["RECAL_BN"])
     if os.environ.get("SMOKE"):
