@@ -69,10 +69,10 @@ def run_dataset(cfg: dict, name: str, gpu: int) -> dict:
         print(f"[data] ds={name} shifted splits {shifted} ready in {time.time() - t0:.0f}s", flush=True)
     res = evaluate_ckpt(tag, ckpt, root, cfg["imgsz"], cfg.get("eval_splits", ["valid"]) + shifted, device, out)
     res.update(dataset=name, train=info, manifest=json.loads((root / "manifest.json").read_text())["splits"])
-    (out / "result.json").write_text(json.dumps(res, indent=2))
     m = res["metrics"][f"valid@{cfg['imgsz']}"]["ignore_aware"]
     sh = {s.split("_", 1)[1]: res["metrics"][f"{s}@{cfg['imgsz']}"]["ignore_aware"]["mAP50_95"] for s in shifted}
     res["shift_mAP50_95"] = round(sum(sh.values()) / len(sh), 3) if sh else None
+    (out / "result.json").write_text(json.dumps(res, indent=2))
     print("[result] " + json.dumps({"dataset": name, "model": cfg["model"], "epochs": cfg["epochs"], "seed": cfg["seed"],
                                     "mods": cfg.get("mods", []), "mAP50_95": m["mAP50_95"],
                                     "shift_mAP50_95": res["shift_mAP50_95"], "shift": sh, "mAP50": m["mAP50"], "AP_small": m["AP_small"],
