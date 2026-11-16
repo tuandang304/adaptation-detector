@@ -253,12 +253,14 @@ class AdaBN(nn.Module):
         self.register_buffer("running_var", bn.running_var.clone())
         self.register_buffer("src_mean", bn.running_mean.clone())
         self.register_buffer("src_var", bn.running_var.clone())
+        self.register_buffer("src_w", bn.weight.detach().clone())  # source affine: source-routed batches must not see adapted affine
+        self.register_buffer("src_b", bn.bias.detach().clone())
         self.momentum, self.anchor, self.update, self.use_src = 0.0, 0.0, False, False
         self.mode, self.prior, self.gamma, self.beta = "ema", 0.8, 10.0, 0.0  # baseline re-implementations, see forward
 
     def forward(self, x):
         if self.use_src:  # routed to the untouched source statistics for this batch
-            return F.batch_norm(x, self.src_mean, self.src_var, self.weight, self.bias, False, 0.0, self.eps)
+            return F.batch_norm(x, self.src_mean, self.src_var, self.src_w, self.src_b, False, 0.0, self.eps)
         if self.mode != "ema" and self.update:  # forward-only baselines that need this batch's statistics
             with torch.no_grad():
                 bv, bm = torch.var_mean(x.detach(), dim=(0, 2, 3), correction=0)
@@ -493,6 +495,13 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     src_params = snapshot(params)
     opt = torch.optim.Adam(params, lr=mcfg.get("lr", 1e-4)) if grad else None
     w_align, w_ent = mcfg.get("loss", {}).get("align", 1.0), mcfg.get("loss", {}).get("ent", 0.0)
+    w_pl = mcfg.get("loss", {}).get("pl", 0.0)  # pseudo-label self-training on a strong view (BN affine only)
+    pl_conf, anchor_w = mcfg.get("pl_conf", 0.4), mcfg.get("anchor_w", 0.0)  # anchor_w: post-step pull of affine toward source
+    if w_pl:
+        from ultralytics.cfg import get_cfg
+        from ultralytics.utils.loss import v8DetectionLoss
+        det.args = get_cfg()
+        crit = v8DetectionLoss(det)
     alpha = mcfg.get("ema_alpha", 0.1)
     sched = mcfg.get("schedule", "always")       # always | periodic | trigger | budget
     K = mcfg.get("period", 10)
@@ -530,6 +539,8 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
     sig_key = sig_keys[0]
     if route:
         def _route(m_, i_, o):
+            if state.get("hold"):
+                return
             v_, m2 = torch.var_mean(o.detach(), dim=(0, 2, 3), correction=0)
             state["stats"] = (m2, v_)
             state["d"] = divergence({sig_key: (m2, v_)}, src_stats)
@@ -544,7 +555,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
         L2 = int(k2.split(".")[0])
 
         def _route2(m_, i_, o):
-            if state["adapted"]:
+            if state["adapted"] or state.get("hold"):
                 return
             v_, m2 = torch.var_mean(o.detach(), dim=(0, 2, 3), correction=0)
             d2 = divergence({k2: (m2, v_)}, src_stats)
@@ -597,6 +608,8 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             do = grad and want and (replay is not None or bucket >= extra_est)
         else:
             raise ValueError(sched)
+        if route and w_pl:  # no self-training while the stream is routed to the source state
+            do = do and (state["adapted"] or state.get("deep", False))
         upd = mom > 0 and (bn_gate == "always" or ood)
         if mom_decay:
             for b in bns:
@@ -616,7 +629,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             for b in bns:
                 b.update = upd
 
-        with torch.set_grad_enabled(do):
+        with torch.set_grad_enabled(do and not w_pl):
             y, raw = det(x)
             st = taps.stats() if need_stats else {}
             if route:
@@ -624,7 +637,7 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             elif need_sig:
                 d = divergence({k: (m.detach(), v.detach()) for k, (m, v) in st.items() if k in sig_keys}, src_stats)
             ast = {k: st[k] for k in align_keys} if st else {}
-            if do:
+            if do and not w_pl:
                 loss = 0.0
                 if w_align:
                     if ema_stats is None:
@@ -646,6 +659,34 @@ def run_method(mcfg, cfg, det0, src_stats, src_div, frames, coco, ids_by_phase, 
             elif ema_stats is not None and ast:  # keep the test-stat EMA current even when not adapting
                 ema_stats = {k: ((1 - alpha) * ema_stats[k][0] + alpha * m.detach(), (1 - alpha) * ema_stats[k][1] + alpha * v.detach())
                              for k, (m, v) in ast.items()}
+
+        if do and w_pl:  # this batch's own detections supervise a strongly augmented view of the same batch
+            pl = non_max_suppression(y.detach(), conf_thres=pl_conf, iou_thres=0.7, max_det=50)
+            if sum(len(o) for o in pl) and not all(b.use_src for b in bns):  # a source-routed batch has nothing to train
+                state["hold"] = True  # keep this batch's routing; the strong view must not touch BN statistics
+                for b in bns:
+                    b.update = False
+                n_ = len(x)
+                xs = (x * (0.6 + 0.8 * torch.rand(n_, 1, 1, 1, device=device)) + 0.2 * (torch.rand(n_, 1, 1, 1, device=device) - 0.5)
+                      + 0.05 * torch.randn_like(x)).clamp_(0, 1)
+                for k_ in range(n_):  # one random erase per image
+                    cy, cx = np.random.randint(0, x.shape[2] - 128), np.random.randint(0, x.shape[3] - 128)
+                    xs[k_, :, cy:cy + 128, cx:cx + 128] = 0.447
+                with torch.enable_grad():
+                    _, raw_s = det(xs)
+                    bb = torch.cat([o[:, :4] for o in pl])
+                    batch = {"batch_idx": torch.cat([torch.full((len(o),), k_, device=device) for k_, o in enumerate(pl)]),
+                             "cls": torch.cat([o[:, 5] for o in pl]),
+                             "bboxes": torch.stack([(bb[:, 0] + bb[:, 2]) / 2, (bb[:, 1] + bb[:, 3]) / 2, bb[:, 2] - bb[:, 0], bb[:, 3] - bb[:, 1]], 1) / x.shape[2]}
+                    loss = w_pl * crit(raw_s, batch)[0].sum()
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    opt.step()
+                if anchor_w:
+                    with torch.no_grad():
+                        for p_, s0 in zip(params, src_params):
+                            p_.lerp_(s0, anchor_w)
+                state["hold"] = False
 
         # ---- signal bookkeeping: fast/slow EMAs, change-point events, clean-return restoration
         d_fast = d if d_fast is None else 0.7 * d_fast + 0.3 * d

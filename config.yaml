@@ -1,3 +1,4 @@
+# Round 9: stack = P4 routing + BN-EMA + burst pseudo-label self-training (BN affine) + source anchoring.
 # Round 8: P4 = P3 + second routing tap (3.conv) for shifts invisible at conv0; robust source fine-tune (shard env: STREAM, WEIGHTS, AUGMIX, METHODS).
 model: yolo11n.pt
 imgsz: 640
@@ -33,5 +34,10 @@ methods:
   - {<<: *P3, name: P3_dense}
   - {<<: *P3, name: P4_dense, route2: true}
   - {<<: *P3, name: P3_b0.1_d30, bn_budget: 0.1, dense: 30}
+  - {<<: *P3, name: R9_full, route2: true, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, schedule: trigger, cp_burst: 30, steady: false, anchor_w: 0.02}
+  - {<<: *P3, name: R9_no_anchor, route2: true, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, schedule: trigger, cp_burst: 30, steady: false}
+  - {<<: *P3, name: R9_burst100, route2: true, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, schedule: trigger, cp_burst: 100, steady: false, anchor_w: 0.02}
+  - {name: pl_always_anchor, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}, anchor_w: 0.02}
+  - {name: pl_always, bn_momentum: 0.05, bn_anchor: 0.01, adapt: grad, lr: 0.001, loss: {align: 0, pl: 1}}
   - {name: oracle_reset, bn_momentum: 0.05, bn_anchor: 0.01, oracle: true}
   - {name: frozen_end}
