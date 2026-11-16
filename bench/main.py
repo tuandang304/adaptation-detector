@@ -60,13 +60,22 @@ def run_dataset(cfg: dict, name: str, gpu: int) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     device = str(gpu) if torch.cuda.is_available() else "cpu"
     ckpt, info = train(cfg["model"], name, root, out, 1 if cfg.get("smoke") else cfg["epochs"], cfg["imgsz"],
-                       cfg["seed"], device, cfg.get("extra"))
-    res = evaluate_ckpt(tag, ckpt, root, cfg["imgsz"], cfg.get("eval_splits", ["valid"]), device, out)
+                       cfg["seed"], device, cfg.get("extra"), cfg.get("mods"))
+    shifted = []
+    if cfg.get("shift_eval"):
+        from . import shift
+        t0 = time.time()
+        shifted = shift.make(root)
+        print(f"[data] ds={name} shifted splits {shifted} ready in {time.time() - t0:.0f}s", flush=True)
+    res = evaluate_ckpt(tag, ckpt, root, cfg["imgsz"], cfg.get("eval_splits", ["valid"]) + shifted, device, out)
     res.update(dataset=name, train=info, manifest=json.loads((root / "manifest.json").read_text())["splits"])
     (out / "result.json").write_text(json.dumps(res, indent=2))
     m = res["metrics"][f"valid@{cfg['imgsz']}"]["ignore_aware"]
+    sh = {s.split("_", 1)[1]: res["metrics"][f"{s}@{cfg['imgsz']}"]["ignore_aware"]["mAP50_95"] for s in shifted}
+    res["shift_mAP50_95"] = round(sum(sh.values()) / len(sh), 3) if sh else None
     print("[result] " + json.dumps({"dataset": name, "model": cfg["model"], "epochs": cfg["epochs"], "seed": cfg["seed"],
-                                    "mAP50_95": m["mAP50_95"], "mAP50": m["mAP50"], "AP_small": m["AP_small"],
+                                    "mods": cfg.get("mods", []), "mAP50_95": m["mAP50_95"],
+                                    "shift_mAP50_95": res["shift_mAP50_95"], "shift": sh, "mAP50": m["mAP50"], "AP_small": m["AP_small"],
                                     "AP_medium": m["AP_medium"], "AP_large": m["AP_large"], **res["efficiency"],
                                     "train_hours": info["train_hours"], "ckpt": ckpt}), flush=True)
     return res
@@ -109,7 +118,7 @@ def main() -> None:
             else:
                 rcs = [subprocess.call(cmd + ["--only", ",".join(ds), "--gpu", "0"]) for ds in cfg["gpu_plan"]]
             done = {p.parent.name: json.loads(p.read_text()) for p in sorted(OUT.glob("*/result.json"))}
-            summary["results"] = {k: {"metrics": v["metrics"], "efficiency": v["efficiency"], "train": v["train"],
+            summary["results"] = {k: {"metrics": v["metrics"], "shift_mAP50_95": v["shift_mAP50_95"], "efficiency": v["efficiency"], "train": v["train"],
                                       "manifest": v["manifest"]} for k, v in done.items()}
             if any(rcs):
                 raise RuntimeError(f"dataset process exit codes {rcs}; finished: {sorted(done)}")
@@ -121,7 +130,8 @@ def main() -> None:
         summary["minutes"] = round((time.time() - t0) / 60, 1)
         (OUT / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     head = {k: v["metrics"][f"valid@{cfg['imgsz']}"]["ignore_aware"]["mAP50_95"] for k, v in summary.get("results", {}).items()}
-    print("[result] " + json.dumps({"stage": stage, "minutes": summary["minutes"], "mAP50_95": head}), flush=True)
+    sh = {k: v["shift_mAP50_95"] for k, v in summary.get("results", {}).items()}
+    print("[result] " + json.dumps({"stage": stage, "minutes": summary["minutes"], "mAP50_95": head, "shift_mAP50_95": sh}), flush=True)
 
 
 if __name__ == "__main__":

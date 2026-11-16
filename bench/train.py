@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def train(model: str, tag: str, data_root: Path, out: Path, epochs: int, imgsz: int, seed: int, device: str,
-          extra: dict | None = None) -> tuple[str, dict]:
+          extra: dict | None = None, mods: list[str] | None = None) -> tuple[str, dict]:
     import torch
     from ultralytics import YOLO
     y = YOLO(f"{model}.pt")
@@ -38,6 +38,11 @@ def train(model: str, tag: str, data_root: Path, out: Path, epochs: int, imgsz: 
     y.add_callback("on_train_start", on_train_start)
     y.add_callback("on_fit_epoch_end", on_fit_epoch_end)
     print(f"[train] ds={tag} {kw}", flush=True)
-    y.train(**kw)
+    if mods:  # the trainer rebuilds the model from its yaml, so the changes are applied inside it
+        from .mods import ModTrainer
+        ModTrainer.mods = list(mods)
+        y.train(trainer=ModTrainer, **kw)
+    else:
+        y.train(**kw)
     return str(out / "train" / "weights" / "best.pt"), {"train_hours": round((time.time() - t0) / 3600, 3),
                                                         "train_kwargs": {k: str(v) for k, v in kw.items()}}
