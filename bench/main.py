@@ -48,12 +48,13 @@ def evaluate_ckpt(tag: str, ckpt: str, root: Path, imgsz: int, splits: list[str]
 
 def run_dataset(cfg: dict, name: str, gpu: int) -> dict:
     """Prepare one dataset, fine-tune on it, score the best checkpoint on val. Headline = ignore-aware mAP50-95
-    (identical to plain COCO AP for datasets without ignore regions)."""
+    (identical to plain COCO AP for datasets without ignore regions).
+    smoke: true = one full epoch (real data, real epoch time and memory); smoke: tiny = one epoch on 64 images."""
     import torch
     from . import data as D
     from .train import train
     root = D.prepare(name, cfg["data_dir"])
-    if cfg.get("smoke"):  # 1 epoch on a small subset: every stage runs, nothing is measured
+    if cfg.get("smoke") == "tiny":  # CPU check of every stage on a few images
         root = D.make_subset(root, root.parent / f"{name}_smoke", {"train": 64, "valid": 32})
     tag, out = f"{cfg['model']}_{name}_s{cfg['seed']}", OUT / name
     out.mkdir(parents=True, exist_ok=True)
