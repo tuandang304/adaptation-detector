@@ -1,0 +1,9 @@
+# Step 2 probe (CPU): list what the candidate dataset copies on Kaggle really contain before writing converters.
+probe:
+  - washingtongold/exdark-dataset
+  - skull6man/ruod-yolo
+  - phanlvnminh/ruod640
+  - abedhossain/ruod-himu
+  - markmoawad/cityscapes-trainval
+  - nimaguia/cityscapes-foggy-validation-yolo
+  - yessicatuteja/foggy-cityscapes-image-dataset
