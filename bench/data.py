@@ -243,8 +243,60 @@ def prep_ruod(out: Path) -> Path:
     return finish(out, names, manifest)
 
 
+# --- BDD100K as a real-shift benchmark (Diverse-Weather style: train on daytime+clear, test on other conditions) ----
+# Labels: one record per image with attributes.timeofday / attributes.weather and labels[].box2d.
+# shortcut: train capped at 12000 and each test set at 2000 images (seed 0) to fit a T4 screening run;
+# lift BDD_CAP before any number goes in a paper.
+BDD = ["bus", "bike", "car", "motor", "person", "rider", "truck"]
+BDD_ALIAS = {"bicycle": "bike", "motorcycle": "motor", "pedestrian": "person"}
+BDD_REF = "solesensei/solesensei_bdd100k"
+BDD_CAP = {"train": 12000, "valid": 2000, "night": 2000, "nightrain": 2000, "duskrain": 2000, "dayrain": 2000}
+# split -> (label files it may draw from, timeofday, weather); train draws only daytime+clear, so the other
+# conditions of the official train file are unseen and can be test images
+BDD_SPLITS = {"train": (("train",), "daytime", "clear"), "valid": (("val",), "daytime", "clear"),
+              "night": (("val",), "night", "clear"), "nightrain": (("train", "val"), "night", "rainy"),
+              "duskrain": (("train", "val"), "dawn/dusk", "rainy"), "dayrain": (("train", "val"), "daytime", "rainy")}
+
+
+def _bdd_items(recs: dict[str, list], img_root: Path, split: str) -> list[Item]:
+    files, tod, weather = BDD_SPLITS[split]
+    items = []
+    for f in files:
+        for r in recs[f]:
+            a = r.get("attributes") or {}
+            if a.get("timeofday") != tod or a.get("weather") != weather:
+                continue
+            boxes = []
+            for lab in r.get("labels") or []:
+                c = BDD_ALIAS.get(lab["category"], lab["category"])
+                if c in BDD and "box2d" in lab:
+                    b = lab["box2d"]
+                    boxes.append((BDD.index(c), b["x1"], b["y1"], b["x2"], b["y2"]))
+            items.append((img_root / f / r["name"], boxes, []))
+    items.sort(key=lambda i: i[0].name)
+    return sorted(random.Random(0).sample(items, min(BDD_CAP[split], len(items))), key=lambda i: i[0].name)
+
+
+def prep_bdd(out: Path) -> Path:
+    raw = fetch_kaggle(BDD_REF, out.parent / "raw")
+    keep = ("name", "attributes", "labels")  # the label files also carry lane and drivable-area polygons
+    recs = {}
+    for f in ("train", "val"):
+        path = next(raw.rglob(f"bdd100k_labels_images_{f}.json"))
+        recs[f] = [{k: r.get(k) for k in keep} for r in json.loads(path.read_text())]
+    img_root = next(p for p in raw.rglob("100k") if (p / "train").is_dir() and p.parent.name == "images")
+    manifest = {"source": f"kaggle:{BDD_REF}; train = daytime+clear of official train, tests = other conditions; "
+                          f"caps {BDD_CAP} (seed 0)", "splits": {}}
+    for split in BDD_SPLITS:
+        items = [i for i in _bdd_items(recs, img_root, split) if i[0].exists()]
+        manifest["splits"][split] = write_split(out, split, BDD, items)
+    n = {k: v["images"] for k, v in manifest["splits"].items()}
+    assert n["train"] >= 8000 and all(v >= 300 for v in n.values()), f"unexpected BDD100K split sizes {n}"
+    return finish(out, BDD, manifest)
+
+
 PREP: dict[str, Callable[[Path], Path]] = {"visdrone": prep_visdrone, "cityscapes": prep_cityscapes,
-                                           "exdark": prep_exdark, "ruod": prep_ruod}
+                                           "exdark": prep_exdark, "ruod": prep_ruod, "bdd": prep_bdd}
 
 
 def prepare(name: str, data_dir: str | Path) -> Path:

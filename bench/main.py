@@ -70,7 +70,9 @@ def run_dataset(cfg: dict, name: str, gpu: int) -> dict:
     res = evaluate_ckpt(tag, ckpt, root, cfg["imgsz"], cfg.get("eval_splits", ["valid"]) + shifted, device, out)
     res.update(dataset=name, train=info, manifest=json.loads((root / "manifest.json").read_text())["splits"])
     m = res["metrics"][f"valid@{cfg['imgsz']}"]["ignore_aware"]
-    sh = {s.split("_", 1)[1]: res["metrics"][f"{s}@{cfg['imgsz']}"]["ignore_aware"]["mAP50_95"] for s in shifted}
+    # every scored split other than the source validation set counts as shifted (synthetic valid_* or real ones)
+    other = [s for s in cfg.get("eval_splits", ["valid"]) + shifted if s not in ("valid", "test")]
+    sh = {s.removeprefix("valid_"): res["metrics"][f"{s}@{cfg['imgsz']}"]["ignore_aware"]["mAP50_95"] for s in other}
     res["shift_mAP50_95"] = round(sum(sh.values()) / len(sh), 3) if sh else None
     (out / "result.json").write_text(json.dumps(res, indent=2))
     print("[result] " + json.dumps({"dataset": name, "model": cfg["model"], "epochs": cfg["epochs"], "seed": cfg["seed"],
