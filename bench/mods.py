@@ -202,9 +202,9 @@ class IIM(nn.Module):
 
     def forward(self, module, inputs):  # forward pre-hook on L0
         img = inputs[0]
-        w = self.k - self.k.mean((1, 2, 3), keepdim=True)
-        f = F.conv2d(torch.log(img.float().clamp(1e-3, 1)), w, padding=1)
-        return ((img.float() + self.out(f)).to(img.dtype),)
+        k = self.k.float()
+        f = F.conv2d(torch.log(img.float().clamp(1e-3, 1)), k - k.mean((1, 2, 3), keepdim=True), padding=1)
+        return ((img.float() + F.conv2d(f, self.out.weight.float(), self.out.bias.float())).to(img.dtype),)
 
 
 def dark_aug(img: torch.Tensor, p: float = 1.0) -> torch.Tensor:
@@ -254,8 +254,8 @@ class SNR(nn.Module):
         x = out.float()
         mu, sd = x.mean((2, 3), keepdim=True), x.std((2, 3), keepdim=True) + 1e-3
         res = x - (x - mu) / sd
-        g = torch.sigmoid(self.se(res.mean((2, 3))))[:, :, None, None]
-        return (x - self.lam[None, :, None, None] * (1 - g) * res).to(out.dtype)
+        g = torch.sigmoid(self.se(res.mean((2, 3)).to(self.lam.dtype)).float())[:, :, None, None]
+        return (x - self.lam.float()[None, :, None, None] * (1 - g) * res).to(out.dtype)
 
 
 def add_style(model: nn.Module) -> None:
@@ -288,7 +288,7 @@ class HeadCond(nn.Module):
 
     def read(self, module, inputs, out):  # forward hook on L10
         x = out.float()
-        y = self.net(torch.cat([x.mean((2, 3)), x.std((2, 3))], 1))
+        y = self.net(torch.cat([x.mean((2, 3)), x.std((2, 3))], 1).to(self.net[0].weight.dtype)).float()
         *ab, self.t = y.split([2 * c for c in self.chs] + [1], 1)
         self.ab = ab
 
@@ -618,6 +618,10 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
             assert all(q.grad is not None and q.grad.abs().sum() > 0 for q in getattr(r, n).parameters()), (mods, n)
         assert all(g.val is None for g in r.grabs.values()) and (not hasattr(r, "cond") or r.cond.t is None)
         print("cluster ok", mods, round(float(loss.sum()), 3))
+    for mods in (["illum"], ["style"], ["head"], full):  # final eval and evaluate.py load best.pt in half precision
+        r = apply(copy.deepcopy(base), mods).eval().half()
+        assert torch.allclose(r(x.half())[0].float(), base.half()(x.half())[0].float(), atol=2e-2), f"{mods} half"
+        base.float()
     for g in AUGS.values():
         y = g(x, 1.0)
         assert y.shape == x.shape and y.min() >= 0 and y.max() <= 1 and not torch.allclose(y, x)
