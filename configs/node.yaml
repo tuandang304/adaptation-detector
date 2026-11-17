@@ -1,10 +1,10 @@
-# YOLO26n + film, mix, cons, fine-tuned from the COCO checkpoint with the fixed screening recipe, BDD100K daytime+clear only.
+# M3-S1-ATB: film + mix + cons, seed 1, BDD100K daytime+clear only
 smoke: false
 data_dir: /tmp/bench_data
 model: yolo26n
 epochs: 30
 imgsz: 640
-seed: 0
+seed: 1
 eval_splits: [valid, night, nightrain, duskrain, dayrain]   # real conditions unseen in training
 shift_eval: false      # real shifted sets instead of synthetic degradations
 mods: [film, mix, cons]
