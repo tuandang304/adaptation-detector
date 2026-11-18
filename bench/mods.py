@@ -20,9 +20,20 @@ Small clusters (each 2 layers, on top of film + mix + cons):
   gcctx      global-context block on the L9 output: x + T(softmax-pooled context), last conv zero-init (stays)
              + DBB inside L22 (folded)
 
+Round 3 (each on top of film + mix + cons + coordatt; the new modules get a training signal tied to shift):
+  fusegate    SANF: L10-conditioned per-group gates 1 + 0.5 tanh on both inputs of Concat L12, L15, L18, L21
+  crossalign  spatial gates from the discrepancy of the two inputs of Concat L12, L15, L18, L21; lateral input noised in
+              the cons pass
+  ndn         x + gamma * s * high-pass(x) on L4, L6, L8; s from an estimator on L4 regressed to synthetic noise/veil
+  sorc        residual bottleneck adapters on L2, L4, L6, detached in the clean detection pass
+  fusegate, ndn and sorc also put night (dark + shot/read noise) or rain (veil + streaks) on half of the cons view;
+  fusegate, crossalign and sorc are detached in the clean detection pass, so they learn only from the cons view.
+
 Hooks are module-level callables so that checkpoints (pickled models) and the EMA deep copy keep them.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -156,17 +167,71 @@ def style_jitter(img: torch.Tensor) -> torch.Tensor:
     return (x * u(0.8, 1.2, 3)).clamp(0, 1).to(img.dtype)
 
 
+class Phase:
+    """Shared by the round-3 modules: which view the forward is on, extra loss terms, degradation targets."""
+
+    def __init__(self):
+        self.shift, self.aux, self.target, self.degrade = False, [], None, None
+
+
+def _phase(model: nn.Module) -> Phase:
+    if not hasattr(model, "phase"):
+        model.phase = Phase()
+    return model.phase
+
+
+def _streak_kernel(n: int, theta: float, device) -> torch.Tensor:
+    r = torch.arange(n, device=device) - n // 2
+    yy, xx = torch.meshgrid(r, r, indexing="ij")
+    return ((xx * math.cos(theta) - yy * math.sin(theta)).abs() < 0.5).float()[None, None]
+
+
+def degrade(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Training only, on the cons view: per sample none (p 1/2), night = dark + shot/read noise (1/4),
+    rain = veil + streaks (1/4). Returns the view and per-sample targets (log1p(noise std / 0.01), 5 * veil)."""
+    b, dev = img.shape[0], img.device
+    x = img.float()
+    u = lambda lo, hi: torch.empty(b, 1, 1, 1, device=dev).uniform_(lo, hi)
+    kind = torch.randint(0, 4, (b, 1, 1, 1), device=dev)
+    night, rain = (kind == 2).float(), (kind == 3).float()
+    dark, shot, read = x * u(0.1, 0.5), u(0.002, 0.02), u(0.01, 0.05)
+    noisy = dark + (dark * shot).sqrt() * torch.randn_like(x) + read * torch.randn_like(x)
+    drops = (torch.rand(b, 1, *x.shape[2:], device=dev) < u(0.001, 0.005)).float()
+    k = _streak_kernel(15, float(torch.empty(()).uniform_(-0.35, 0.35)), dev)
+    veil = u(0.05, 0.3)
+    wet = x * (1 - veil) + 0.8 * veil + u(0.2, 0.5) * F.conv2d(drops, k, padding=7).clamp(0, 1)
+    out = x * (1 - night - rain) + noisy * night + wet * rain
+    sigma = (read + (dark.mean((1, 2, 3), keepdim=True) * shot).sqrt()) * night
+    target = torch.cat([torch.log1p(sigma / 0.01), 5 * veil * rain], 1).flatten(1)
+    return out.clamp(0, 1).to(img.dtype), target
+
+
 class ConsistModel(DetectionModel):
     cons_weight = 1.0
 
     def loss(self, batch, preds=None):
+        ph = getattr(self, "phase", None)
+        if ph is not None:
+            ph.aux, ph.target = [], None
         loss, items = super().loss(batch, preds)
         if not self.training or preds is not None:
             return loss, items
         f1, self.tap.feats = self.tap.feats, None
-        self.forward(style_jitter(batch["img"]))
+        view = style_jitter(batch["img"])
+        if ph is not None:
+            if ph.degrade is not None:
+                view, ph.target = ph.degrade(view)
+            ph.shift = True
+        try:
+            self.forward(view)
+        finally:
+            if ph is not None:
+                ph.shift = False
         f2, self.tap.feats = self.tap.feats, None
         c = sum(1 - F.cosine_similarity(a.detach().float(), b.float(), dim=1).mean() for a, b in zip(f1, f2)) / len(f1)
+        if ph is not None:
+            c = c + sum(ph.aux, torch.zeros((), device=c.device))
+            ph.aux, ph.target = [], None
         # the trainer sums the loss vector, which is already scaled by the batch size
         return loss + self.cons_weight * c * batch["img"].shape[0] / loss.numel(), items
 
@@ -323,8 +388,171 @@ def add_gcctx(model: nn.Module) -> None:
     dbb_on(model, (22,))
 
 
+# --- round 3 (on top of film + mix + cons + coordatt; all need cons for their training signal) -------------------
+CONCATS = (12, 15, 18, 21)  # inputs: [path feature, lateral/skip feature]
+
+
+class _Hook:
+    """Module-level callable that forwards a hook to owner.<name>(k, ...), so checkpoints can pickle it."""
+
+    def __init__(self, owner: nn.Module, name: str, k: int):
+        self.owner, self.name, self.k = owner, name, k
+
+    def __call__(self, *args):
+        return getattr(self.owner, self.name)(self.k, *args)
+
+
+class FuseGate(nn.Module):
+    """SANF: GAP(L10) -> 16 -> per-group gates 1 + 0.5 tanh on both inputs of each neck Concat; last layer zero-init.
+    Detached in the clean detection pass, so the gates learn only from cons on the degraded view."""
+    G = 8
+
+    def __init__(self, c_ctx: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(c_ctx, 16), nn.SiLU(), nn.Linear(16, 2 * len(CONCATS) * self.G))
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+        self.phase, self.g = None, None
+
+    def ctx(self, k, module, inputs, out):
+        g = 1 + 0.5 * torch.tanh(self.mlp(out.mean((2, 3))))
+        if module.training and not self.phase.shift:
+            g = g.detach()
+        self.g = g.view(g.shape[0], -1, self.G)
+
+    def gate(self, k, module, inputs):
+        xs = list(inputs[0])
+        for j in range(2):
+            c = xs[j].shape[1]
+            xs[j] = xs[j] * self.g[:, 2 * k + j].repeat_interleave(c // self.G, 1)[:, :, None, None]
+        if k == len(CONCATS) - 1:
+            self.g = None  # holds the graph; cleared so that deep copies of the model work
+        return (xs,)
+
+
+def add_fusegate(model: nn.Module) -> None:
+    model.fusegate = FuseGate(model.model[10].cv2.conv.out_channels)
+    model.fusegate.phase = ph = _phase(model)
+    ph.degrade = degrade
+    model.model[10].register_forward_hook(_Hook(model.fusegate, "ctx", 0))
+    for k, i in enumerate(CONCATS):
+        model.model[i].register_forward_pre_hook(_Hook(model.fusegate, "gate", k))
+
+
+class CrossAlign(nn.Module):
+    """Spatial gates from the discrepancy of the two Concat inputs: |1x1(a) - 1x1(b)| -> dw3 -> zero-init 1x1 -> 2 masks,
+    inputs scaled by 1 + 0.2 tanh(mask). Detached in the clean pass; in the cons pass the lateral input gets noise/blur."""
+
+    def __init__(self, ca: int, cb: int, mid: int = 16):
+        super().__init__()
+        self.pa, self.pb, self.dw = Conv(ca, mid, 1), Conv(cb, mid, 1), Conv(mid, mid, 3, 1, None, mid)
+        self.m = nn.Conv2d(mid, 2, 1)
+        nn.init.zeros_(self.m.weight)
+        nn.init.zeros_(self.m.bias)
+        self.phase = None
+
+    def forward(self, module, inputs):
+        a, b = inputs[0]
+        if module.training and self.phase.shift:
+            sd = b.detach().std((2, 3), keepdim=True)
+            b = b + 0.5 * torch.rand(b.shape[0], 1, 1, 1, device=b.device, dtype=b.dtype) * sd * torch.randn_like(b)
+            if torch.rand(()) < 0.5:
+                b = F.avg_pool2d(b, 3, 1, 1, count_include_pad=False)
+        m = 0.2 * torch.tanh(self.m(self.dw((self.pa(a) - self.pb(b)).abs())))
+        if module.training and not self.phase.shift:
+            m = m.detach()
+        return ([a * (1 + m[:, :1]), b * (1 + m[:, 1:])],)
+
+
+def add_crossalign(model: nn.Module) -> None:
+    shapes = {}
+    hs = [model.model[i].register_forward_pre_hook(lambda mod, inp, i=i: shapes.__setitem__(i, [t.shape[1] for t in inp[0]]))
+          for i in CONCATS]
+    was = model.training
+    with torch.no_grad():
+        model.eval()(torch.zeros(1, 3, 64, 64))
+    model.train(was)
+    for h in hs:
+        h.remove()
+    model.crossalign = nn.ModuleList()
+    ph = _phase(model)
+    for i in CONCATS:
+        g = CrossAlign(*shapes[i])
+        g.phase = ph
+        model.crossalign.append(g)
+        model.model[i].register_forward_pre_hook(g)
+
+
+class NDN(nn.Module):
+    """out = x + gamma * s * (x - avg3(x)) on L4, L6, L8; gamma zero-init. s = 1 + 0.5 tanh(a . p) per image, p from a
+    zero-init estimator on GAP|high-pass of L4|, regressed on the cons view to its synthetic noise level and veil."""
+
+    def __init__(self, chs: list[int]):
+        super().__init__()
+        self.est = nn.Sequential(nn.Linear(chs[0], 16), nn.SiLU(), nn.Linear(16, 2))
+        nn.init.zeros_(self.est[2].weight)
+        nn.init.zeros_(self.est[2].bias)
+        self.a = nn.Parameter(torch.ones(2))
+        self.gamma = nn.ParameterList([nn.Parameter(torch.zeros(c)) for c in chs])
+        self.phase, self.s = None, None
+
+    def modulate(self, k, module, inputs, x):
+        h = x - F.avg_pool2d(x, 3, 1, 1, count_include_pad=False)
+        if k == 0:
+            p = self.est(h.abs().mean((2, 3)))
+            if module.training and self.phase.shift and self.phase.target is not None:
+                self.phase.aux.append(0.1 * F.mse_loss(p.float(), self.phase.target.float()))
+            self.s = 1 + 0.5 * torch.tanh(p @ self.a)
+        out = x + self.gamma[k].view(1, -1, 1, 1) * self.s.view(-1, 1, 1, 1) * h
+        if k == len(self.gamma) - 1:
+            self.s = None
+        return out
+
+
+def add_ndn(model: nn.Module) -> None:
+    layers = (4, 6, 8)
+    model.ndn = NDN([model.model[i].cv2.conv.out_channels for i in layers])
+    model.ndn.phase = ph = _phase(model)
+    ph.degrade = degrade
+    for k, i in enumerate(layers):
+        model.model[i].register_forward_hook(_Hook(model.ndn, "modulate", k))
+
+
+class Adapter(nn.Module):
+    """SORC: x + up(dw3(down(x))), up zero-init. Detached in the clean detection pass (plus a 1e-3 penalty on its
+    output there), so it learns only from cons on the degraded view."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        mid = c // 4
+        self.down, self.dw, self.up = Conv(c, mid, 1), Conv(mid, mid, 3, 1, None, mid), nn.Conv2d(mid, c, 1)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+        self.phase = None
+
+    def forward(self, module, inputs, x):
+        d = self.up(self.dw(self.down(x)))
+        if module.training and not self.phase.shift:
+            self.phase.aux.append(1e-3 * d.float().pow(2).mean())
+            return x + d.detach()
+        return x + d
+
+
+def add_sorc(model: nn.Module) -> None:
+    model.sorc = nn.ModuleList()
+    ph = _phase(model)
+    ph.degrade = degrade
+    for i in (2, 4, 6):
+        a = Adapter(model.model[i].cv2.conv.out_channels)
+        a.phase = ph
+        model.sorc.append(a)
+        model.model[i].register_forward_hook(a)
+
+
+ROUND3 = ("fusegate", "crossalign", "ndn", "sorc")
 ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons, "dbb": add_dbb,
-       "dbbp3": add_dbbp3, "spddetail": add_spddetail, "coordatt": add_coordatt, "gcctx": add_gcctx}
+       "dbbp3": add_dbbp3, "spddetail": add_spddetail, "coordatt": add_coordatt, "gcctx": add_gcctx,
+       "fusegate": add_fusegate, "crossalign": add_crossalign, "ndn": add_ndn, "sorc": add_sorc}
 
 
 def apply(model: nn.Module, mods: list[str]) -> nn.Module:
@@ -363,7 +591,7 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     base = YOLO("yolo26n.pt").model.float().eval()
     x = torch.rand(2, 3, 256, 256)
     ref = base(x)[0]
-    m = apply(copy.deepcopy(base), [k for k in ADD if k not in ("dbb", "dbbp3", "spddetail", "gcctx")])  # dbb and rep both rewrite the neck 3x3 convs
+    m = apply(copy.deepcopy(base), [k for k in ADD if k not in ("dbb", "dbbp3", "spddetail", "gcctx") + ROUND3])  # dbb and rep both rewrite the neck 3x3 convs
     assert torch.allclose(m.eval()(x)[0], ref, atol=1e-4), "not identical to the pretrained model at step 0"
     for p in m.parameters():  # move off the zero init so that fusing is actually tested
         if p.abs().sum() == 0:
@@ -425,14 +653,17 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     assert all(q.grad is not None for k in r.modules() if isinstance(k, DBB) for q in k.bn1.parameters())
     print("dbb ok: branched convs", n_dbb, "deployed params", sum(q.numel() for q in fz.parameters()))
     film_fused = sum(q.numel() for q in apply(copy.deepcopy(base), ["film"]).fuse(verbose=False).parameters())
-    for name, kept in (("dbbp3", ()), ("spddetail", ("spd",)), ("coordatt", ("coordatt",)), ("gcctx", ("gc",))):
-        r = apply(copy.deepcopy(base), ["film", "mix", "cons", name]).eval()
+    for name, kept in (("dbbp3", ()), ("spddetail", ("spd",)), ("coordatt", ("coordatt",)), ("gcctx", ("gc",)),
+                       *((k, ("coordatt", k)) for k in ROUND3)):
+        r = apply(copy.deepcopy(base), ["film", "mix", "cons"] + (["coordatt"] if name in ROUND3 else []) + [name]).eval()
         assert torch.allclose(r(x)[0], ref, atol=1e-4), f"{name}: not identical at step 0"
         r.train()
         with torch.no_grad():
             for _ in range(3):
                 r(torch.rand(2, 3, 256, 256))
         r.tap.feats = None
+        if hasattr(r, "phase"):
+            r.phase.aux = []
         r.eval()
         for q in r.parameters():
             if q.abs().sum() == 0:
@@ -457,5 +688,6 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
         loss.sum().backward()
         for k in kept:
             assert all(q.grad is not None and q.grad.abs().sum() > 0 for q in getattr(r, k).parameters()), (name, k)
+        assert r.tap.feats is None and (not hasattr(r, "phase") or (r.phase.aux == [] and not r.phase.shift)), name
         print(f"{name} ok: deployed params {sum(q.numel() for q in fz.parameters())} (+{extra} kept over film)")
     print("mods self-check ok", SimpleNamespace(loss=float(loss.sum())))
