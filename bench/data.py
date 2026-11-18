@@ -133,7 +133,8 @@ def fetch_kaggle(ref: str, raw: Path) -> Path:
     raw.mkdir(parents=True, exist_ok=True)
     print(f"[data] downloading kaggle:{ref}", flush=True)
     t0 = time.time()
-    if "KAGGLE_USER_SECRETS_TOKEN" in os.environ:
+    # Colab: kagglehub reads the dataset through Colab's own Kaggle access (anonymous HTTP gets 404 there)
+    if {"KAGGLE_USER_SECRETS_TOKEN", "COLAB_RELEASE_TAG", "KAGGLE_KEY", "KAGGLE_API_TOKEN"} & set(os.environ):
         import kagglehub
         os.environ["KAGGLEHUB_CACHE"] = str(raw / "kagglehub")
         run_type = os.environ.pop("KAGGLE_KERNEL_RUN_TYPE", None)

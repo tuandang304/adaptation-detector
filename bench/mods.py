@@ -20,9 +20,27 @@ Small clusters (each 2 layers, on top of film + mix + cons):
   gcctx      global-context block on the L9 output: x + T(softmax-pooled context), last conv zero-init (stays)
              + DBB inside L22 (folded)
 
+Round 3 (each on top of film + mix + cons + coordatt; the new modules get a training signal tied to shift):
+  fusegate    SANF: L10-conditioned per-group gates 1 + 0.5 tanh on both inputs of Concat L12, L15, L18, L21
+  crossalign  spatial gates from the discrepancy of the two inputs of Concat L12, L15, L18, L21; lateral input noised in
+              the cons pass
+  ndn         x + gamma * s * high-pass(x) on L4, L6, L8; s from an estimator on L4 regressed to synthetic noise/veil
+  sorc        residual bottleneck adapters on L2, L4, L6, detached in the clean detection pass
+  fusegate, ndn and sorc also put night (dark + shot/read noise) or rain (veil + streaks) on half of the cons view;
+  fusegate, crossalign and sorc are detached in the clean detection pass, so they learn only from the cons view.
+
+Round 4 (stronger structural changes, each on top of film + mix + cons + coordatt, no synthetic generator):
+  dynconv   every plain 3x3 Conv in L6, L8 and the stride-2 Conv L7: conv(x) + A(pi(x) * B(x)), input-routed low-rank
+            kernel delta (K=3 experts of rank 8), A zero-init, BN folded into conv and A at fuse
+  p2        slim stride-4 detection level from L2 and the P3 input, light heads in both Detect branches; class
+            logits offset -30 fading to 0 over the first 1500 training forwards
+  dysample  learned point-sampling upsampling at L11, L14 as a zero-gated residual on nearest
+
 Hooks are module-level callables so that checkpoints (pickled models) and the EMA deep copy keep them.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -156,17 +174,71 @@ def style_jitter(img: torch.Tensor) -> torch.Tensor:
     return (x * u(0.8, 1.2, 3)).clamp(0, 1).to(img.dtype)
 
 
+class Phase:
+    """Shared by the round-3 modules: which view the forward is on, extra loss terms, degradation targets."""
+
+    def __init__(self):
+        self.shift, self.aux, self.target, self.degrade = False, [], None, None
+
+
+def _phase(model: nn.Module) -> Phase:
+    if not hasattr(model, "phase"):
+        model.phase = Phase()
+    return model.phase
+
+
+def _streak_kernel(n: int, theta: float, device) -> torch.Tensor:
+    r = torch.arange(n, device=device) - n // 2
+    yy, xx = torch.meshgrid(r, r, indexing="ij")
+    return ((xx * math.cos(theta) - yy * math.sin(theta)).abs() < 0.5).float()[None, None]
+
+
+def degrade(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Training only, on the cons view: per sample none (p 1/2), night = dark + shot/read noise (1/4),
+    rain = veil + streaks (1/4). Returns the view and per-sample targets (log1p(noise std / 0.01), 5 * veil)."""
+    b, dev = img.shape[0], img.device
+    x = img.float()
+    u = lambda lo, hi: torch.empty(b, 1, 1, 1, device=dev).uniform_(lo, hi)
+    kind = torch.randint(0, 4, (b, 1, 1, 1), device=dev)
+    night, rain = (kind == 2).float(), (kind == 3).float()
+    dark, shot, read = x * u(0.1, 0.5), u(0.002, 0.02), u(0.01, 0.05)
+    noisy = dark + (dark * shot).sqrt() * torch.randn_like(x) + read * torch.randn_like(x)
+    drops = (torch.rand(b, 1, *x.shape[2:], device=dev) < u(0.001, 0.005)).float()
+    k = _streak_kernel(15, float(torch.empty(()).uniform_(-0.35, 0.35)), dev)
+    veil = u(0.05, 0.3)
+    wet = x * (1 - veil) + 0.8 * veil + u(0.2, 0.5) * F.conv2d(drops, k, padding=7).clamp(0, 1)
+    out = x * (1 - night - rain) + noisy * night + wet * rain
+    sigma = (read + (dark.mean((1, 2, 3), keepdim=True) * shot).sqrt()) * night
+    target = torch.cat([torch.log1p(sigma / 0.01), 5 * veil * rain], 1).flatten(1)
+    return out.clamp(0, 1).to(img.dtype), target
+
+
 class ConsistModel(DetectionModel):
     cons_weight = 1.0
 
     def loss(self, batch, preds=None):
+        ph = getattr(self, "phase", None)
+        if ph is not None:
+            ph.aux, ph.target = [], None
         loss, items = super().loss(batch, preds)
         if not self.training or preds is not None:
             return loss, items
         f1, self.tap.feats = self.tap.feats, None
-        self.forward(style_jitter(batch["img"]))
+        view = style_jitter(batch["img"])
+        if ph is not None:
+            if ph.degrade is not None:
+                view, ph.target = ph.degrade(view)
+            ph.shift = True
+        try:
+            self.forward(view)
+        finally:
+            if ph is not None:
+                ph.shift = False
         f2, self.tap.feats = self.tap.feats, None
         c = sum(1 - F.cosine_similarity(a.detach().float(), b.float(), dim=1).mean() for a, b in zip(f1, f2)) / len(f1)
+        if ph is not None:
+            c = c + sum(ph.aux, torch.zeros((), device=c.device))
+            ph.aux, ph.target = [], None
         # the trainer sums the loss vector, which is already scaled by the batch size
         return loss + self.cons_weight * c * batch["img"].shape[0] / loss.numel(), items
 
@@ -323,8 +395,307 @@ def add_gcctx(model: nn.Module) -> None:
     dbb_on(model, (22,))
 
 
+# --- round 3 (on top of film + mix + cons + coordatt; all need cons for their training signal) -------------------
+CONCATS = (12, 15, 18, 21)  # inputs: [path feature, lateral/skip feature]
+
+
+class _Hook:
+    """Module-level callable that forwards a hook to owner.<name>(k, ...), so checkpoints can pickle it."""
+
+    def __init__(self, owner: nn.Module, name: str, k: int):
+        self.owner, self.name, self.k = owner, name, k
+
+    def __call__(self, *args):
+        return getattr(self.owner, self.name)(self.k, *args)
+
+
+class FuseGate(nn.Module):
+    """SANF: GAP(L10) -> 16 -> per-group gates 1 + 0.5 tanh on both inputs of each neck Concat; last layer zero-init.
+    Detached in the clean detection pass, so the gates learn only from cons on the degraded view."""
+    G = 8
+
+    def __init__(self, c_ctx: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(c_ctx, 16), nn.SiLU(), nn.Linear(16, 2 * len(CONCATS) * self.G))
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+        self.phase, self.g = None, None
+
+    def ctx(self, k, module, inputs, out):
+        g = 1 + 0.5 * torch.tanh(self.mlp(out.mean((2, 3))))
+        if module.training and not self.phase.shift:
+            g = g.detach()
+        self.g = g.view(g.shape[0], -1, self.G)
+
+    def gate(self, k, module, inputs):
+        xs = list(inputs[0])
+        for j in range(2):
+            c = xs[j].shape[1]
+            xs[j] = xs[j] * self.g[:, 2 * k + j].repeat_interleave(c // self.G, 1)[:, :, None, None]
+        if k == len(CONCATS) - 1:
+            self.g = None  # holds the graph; cleared so that deep copies of the model work
+        return (xs,)
+
+
+def add_fusegate(model: nn.Module) -> None:
+    model.fusegate = FuseGate(model.model[10].cv2.conv.out_channels)
+    model.fusegate.phase = ph = _phase(model)
+    ph.degrade = degrade
+    model.model[10].register_forward_hook(_Hook(model.fusegate, "ctx", 0))
+    for k, i in enumerate(CONCATS):
+        model.model[i].register_forward_pre_hook(_Hook(model.fusegate, "gate", k))
+
+
+class CrossAlign(nn.Module):
+    """Spatial gates from the discrepancy of the two Concat inputs: |1x1(a) - 1x1(b)| -> dw3 -> zero-init 1x1 -> 2 masks,
+    inputs scaled by 1 + 0.2 tanh(mask). Detached in the clean pass; in the cons pass the lateral input gets noise/blur."""
+
+    def __init__(self, ca: int, cb: int, mid: int = 16):
+        super().__init__()
+        self.pa, self.pb, self.dw = Conv(ca, mid, 1), Conv(cb, mid, 1), Conv(mid, mid, 3, 1, None, mid)
+        self.m = nn.Conv2d(mid, 2, 1)
+        nn.init.zeros_(self.m.weight)
+        nn.init.zeros_(self.m.bias)
+        self.phase = None
+
+    def forward(self, module, inputs):
+        a, b = inputs[0]
+        if module.training and self.phase.shift:
+            sd = b.detach().std((2, 3), keepdim=True)
+            b = b + 0.5 * torch.rand(b.shape[0], 1, 1, 1, device=b.device, dtype=b.dtype) * sd * torch.randn_like(b)
+            if torch.rand(()) < 0.5:
+                b = F.avg_pool2d(b, 3, 1, 1, count_include_pad=False)
+        m = 0.2 * torch.tanh(self.m(self.dw((self.pa(a) - self.pb(b)).abs())))
+        if module.training and not self.phase.shift:
+            m = m.detach()
+        return ([a * (1 + m[:, :1]), b * (1 + m[:, 1:])],)
+
+
+def add_crossalign(model: nn.Module) -> None:
+    shapes = {}
+    hs = [model.model[i].register_forward_pre_hook(lambda mod, inp, i=i: shapes.__setitem__(i, [t.shape[1] for t in inp[0]]))
+          for i in CONCATS]
+    was = model.training
+    with torch.no_grad():
+        model.eval()(torch.zeros(1, 3, 64, 64))
+    model.train(was)
+    for h in hs:
+        h.remove()
+    model.crossalign = nn.ModuleList()
+    ph = _phase(model)
+    for i in CONCATS:
+        g = CrossAlign(*shapes[i])
+        g.phase = ph
+        model.crossalign.append(g)
+        model.model[i].register_forward_pre_hook(g)
+
+
+class NDN(nn.Module):
+    """out = x + gamma * s * (x - avg3(x)) on L4, L6, L8; gamma zero-init. s = 1 + 0.5 tanh(a . p) per image, p from a
+    zero-init estimator on GAP|high-pass of L4|, regressed on the cons view to its synthetic noise level and veil."""
+
+    def __init__(self, chs: list[int]):
+        super().__init__()
+        self.est = nn.Sequential(nn.Linear(chs[0], 16), nn.SiLU(), nn.Linear(16, 2))
+        nn.init.zeros_(self.est[2].weight)
+        nn.init.zeros_(self.est[2].bias)
+        self.a = nn.Parameter(torch.ones(2))
+        self.gamma = nn.ParameterList([nn.Parameter(torch.zeros(c)) for c in chs])
+        self.phase, self.s = None, None
+
+    def modulate(self, k, module, inputs, x):
+        h = x - F.avg_pool2d(x, 3, 1, 1, count_include_pad=False)
+        if k == 0:
+            p = self.est(h.abs().mean((2, 3)))
+            if module.training and self.phase.shift and self.phase.target is not None:
+                self.phase.aux.append(0.1 * F.mse_loss(p.float(), self.phase.target.float()))
+            self.s = 1 + 0.5 * torch.tanh(p @ self.a)
+        out = x + self.gamma[k].view(1, -1, 1, 1) * self.s.view(-1, 1, 1, 1) * h
+        if k == len(self.gamma) - 1:
+            self.s = None
+        return out
+
+
+def add_ndn(model: nn.Module) -> None:
+    layers = (4, 6, 8)
+    model.ndn = NDN([model.model[i].cv2.conv.out_channels for i in layers])
+    model.ndn.phase = ph = _phase(model)
+    ph.degrade = degrade
+    for k, i in enumerate(layers):
+        model.model[i].register_forward_hook(_Hook(model.ndn, "modulate", k))
+
+
+class Adapter(nn.Module):
+    """SORC: x + up(dw3(down(x))), up zero-init. Detached in the clean detection pass (plus a 1e-3 penalty on its
+    output there), so it learns only from cons on the degraded view."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        mid = c // 4
+        self.down, self.dw, self.up = Conv(c, mid, 1), Conv(mid, mid, 3, 1, None, mid), nn.Conv2d(mid, c, 1)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+        self.phase = None
+
+    def forward(self, module, inputs, x):
+        d = self.up(self.dw(self.down(x)))
+        if module.training and not self.phase.shift:
+            self.phase.aux.append(1e-3 * d.float().pow(2).mean())
+            return x + d.detach()
+        return x + d
+
+
+def add_sorc(model: nn.Module) -> None:
+    model.sorc = nn.ModuleList()
+    ph = _phase(model)
+    ph.degrade = degrade
+    for i in (2, 4, 6):
+        a = Adapter(model.model[i].cv2.conv.out_channels)
+        a.phase = ph
+        model.sorc.append(a)
+        model.model[i].register_forward_hook(a)
+
+
+# --- round 4: stronger structural changes (on top of film + mix + cons + coordatt; no synthetic generator) ---------
+class DynConv(Conv2):
+    """Pretrained Conv plus an input-routed low-rank kernel delta: conv(x) + A(pi(x) * B(x)). B = K*r 3x3 filters,
+    A = zero-init 1x1, pi = softmax of a zero-init router on GAP(x). A Conv2 so that BaseModel.fuse() calls fuse_convs,
+    which folds the BatchNorm into conv and into A; the delta stays (static convs + per-image channel scaling)."""
+
+    def _delta(self, x):
+        p = torch.softmax(self.route(x.mean((2, 3))), 1)
+        return self.dA(self.dB(x) * p.repeat_interleave(self.dB.out_channels // p.shape[1], 1)[:, :, None, None])
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x) + self._delta(x)))
+
+    def forward_fuse(self, x):
+        return self.act(self.conv(x) + self._delta(x))
+
+    def fuse_convs(self):
+        bn, c = self.bn, self.conv
+        t = bn.weight.float() / (bn.running_var.float() + bn.eps).sqrt()
+        w, b = _fold(c.weight, bn, c.bias)
+        conv = nn.Conv2d(c.in_channels, c.out_channels, c.kernel_size, c.stride, c.padding, bias=True).to(c.weight.device)
+        conv.weight.data, conv.bias.data = w.to(c.weight.dtype), b.to(c.weight.dtype)
+        self.conv = conv
+        self.dA.weight.data = (self.dA.weight.float() * t[:, None, None, None]).to(self.dA.weight.dtype)
+        bn.weight.data.fill_(1)  # identity BatchNorm, folded away by BaseModel.fuse()
+        bn.bias.data.zero_()
+        bn.running_mean.zero_()
+        bn.running_var.fill_(1 - bn.eps)
+
+
+def to_dyn(m: Conv, k: int = 3, r: int = 8) -> DynConv:
+    c = m.conv
+    m.__class__ = DynConv
+    m.route = nn.Linear(c.in_channels, k)
+    m.dB = nn.Conv2d(c.in_channels, k * r, c.kernel_size, c.stride, c.padding, bias=False)
+    m.dA = nn.Conv2d(k * r, c.out_channels, 1, bias=False)
+    for z in (m.route.weight, m.route.bias, m.dA.weight):
+        nn.init.zeros_(z)
+    for n in ("route", "dB", "dA"):
+        getattr(m, n).to(c.weight.device)
+    return m
+
+
+def add_dynconv(model: nn.Module) -> None:
+    """D1: every plain 3x3 Conv inside L6 and L8, and the stride-2 Conv L7."""
+    assert not any(isinstance(q, (DBB, RepConv)) for q in model.modules()), "dynconv rewrites the same convs as dbb/rep"
+    convs = [q for i in (6, 8) for q in model.model[i].modules()
+             if type(q) is Conv and q.conv.kernel_size == (3, 3) and q.conv.groups == 1] + [model.model[7]]
+    model.dyn = nn.ModuleList(nn.ModuleList([d.route, d.dB, d.dA]) for d in map(to_dyn, convs))
+
+
+class P2Level(nn.Module):
+    """D2: slim stride-4 detection level. Feature = DW3(1x1(L2 out) + up2(1x1(P3 input))), 16 channels; light DW3 + 1x1
+    box and class heads in both Detect branches. Class logits get an offset that fades from -30 to 0 over the first
+    `warm` training forwards (a float buffer, so the EMA copy follows), so the output equals the pretrained one at step 0."""
+
+    def __init__(self, c2: int, c3: int, c: int = 16, warm: int = 1500):
+        super().__init__()
+        self.a, self.b, self.mix = Conv(c2, c, 1), Conv(c3, c, 1), Conv(c, c, 3, 1, None, c)
+        self.register_buffer("seen", torch.zeros(()))
+        self.warm, self.src = warm, None
+
+    def offset(self):
+        return -30.0 * (1 - self.seen.float() / self.warm).clamp(0, 1)
+
+    def grab(self, k, module, inputs, out):
+        self.src = out
+
+    def expand(self, k, module, inputs):
+        x = list(inputs[0])
+        if module.training:
+            self.seen += 1
+        p2 = self.mix(self.a(self.src) + F.interpolate(self.b(x[0]), scale_factor=2.0, mode="nearest"))
+        self.src = None  # holds the graph; cleared so that deep copies of the model work
+        return ([p2] + x,)
+
+    def cls_offset(self, k, module, inputs, out):
+        return out + self.offset().to(out.dtype)
+
+
+def add_p2(model: nn.Module) -> None:
+    det = model.model[-1]
+    assert det.nl == 3 and det.f == [16, 19, 22]
+    c = 16
+    model.p2 = p2 = P2Level(model.model[2].cv2.conv.out_channels, model.model[16].cv2.conv.out_channels, c)
+    model.model[2].register_forward_hook(_Hook(p2, "grab", 0))
+    det.register_forward_pre_hook(_Hook(p2, "expand", 0))
+    branches = [("cv2", "cv3")] + ([("one2one_cv2", "one2one_cv3")] if getattr(det, "one2one_cv2", None) is not None else [])
+    for box_name, cls_name in branches:
+        box = nn.Sequential(Conv(c, c, 3, 1, None, c), nn.Conv2d(c, 4 * det.reg_max, 1))
+        cls = nn.Sequential(Conv(c, c, 3, 1, None, c), nn.Conv2d(c, det.nc, 1))
+        box[-1].bias.data[:] = 2.0  # as Detect.bias_init
+        cls[-1].bias.data[:] = math.log(5 / det.nc / (640 / 4) ** 2)
+        cls[-1].register_forward_hook(_Hook(p2, "cls_offset", 0))
+        getattr(det, box_name).insert(0, box)
+        getattr(det, cls_name).insert(0, cls)
+    det.nl, det.shape = 4, None
+    det.stride = torch.cat([torch.tensor([4.0]), det.stride])
+    model.stride = det.stride
+    model.to(next(det.parameters()).device)
+
+
+class DySample(nn.Module):
+    """D3: learned point-sampling 2x upsampling as a residual on nearest:
+    out = nearest(x) + g * (grid_sample(x, base + 0.25 * pixel_shuffle(offset(x))) - nearest(x)), g zero-init."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.off = nn.Conv2d(c, 8, 1)
+        nn.init.normal_(self.off.weight, std=0.001)
+        nn.init.zeros_(self.off.bias)
+        self.g = nn.Parameter(torch.zeros(c))
+
+    def forward(self, module, inputs, out):
+        x = inputs[0]
+        h, w = x.shape[2:]
+        o = F.pixel_shuffle(self.off(x) * 0.25, 2).float()  # (b, 2, 2h, 2w): x, y offsets in input pixels
+        ys = (torch.arange(2 * h, device=x.device, dtype=torch.float32) + 0.5) / h - 1
+        xs = (torch.arange(2 * w, device=x.device, dtype=torch.float32) + 0.5) / w - 1
+        base = torch.stack(torch.meshgrid(xs, ys, indexing="xy"), -1)  # (2h, 2w, 2) as (x, y)
+        grid = base + o.permute(0, 2, 3, 1) * torch.tensor([2.0 / w, 2.0 / h], device=x.device)
+        s = F.grid_sample(x.float(), grid, mode="bilinear", padding_mode="border", align_corners=False).to(out.dtype)
+        return out + self.g.view(1, -1, 1, 1) * (s - out)
+
+
+def add_dysample(model: nn.Module) -> None:
+    assert all(isinstance(model.model[i], nn.Upsample) for i in (11, 14))
+    model.dysample = nn.ModuleList()
+    for i, src in ((11, 10), (14, 13)):
+        d = DySample(model.model[src].cv2.conv.out_channels)
+        model.dysample.append(d)
+        model.model[i].register_forward_hook(d)
+
+
+ROUND3 = ("fusegate", "crossalign", "ndn", "sorc")
+ROUND4 = {"dynconv": "dyn", "p2": "p2", "dysample": "dysample"}  # mod -> attribute holding its modules
 ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons, "dbb": add_dbb,
-       "dbbp3": add_dbbp3, "spddetail": add_spddetail, "coordatt": add_coordatt, "gcctx": add_gcctx}
+       "dbbp3": add_dbbp3, "spddetail": add_spddetail, "coordatt": add_coordatt, "gcctx": add_gcctx,
+       "fusegate": add_fusegate, "crossalign": add_crossalign, "ndn": add_ndn, "sorc": add_sorc,
+       "dynconv": add_dynconv, "p2": add_p2, "dysample": add_dysample}
 
 
 def apply(model: nn.Module, mods: list[str]) -> nn.Module:
@@ -363,7 +734,7 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     base = YOLO("yolo26n.pt").model.float().eval()
     x = torch.rand(2, 3, 256, 256)
     ref = base(x)[0]
-    m = apply(copy.deepcopy(base), [k for k in ADD if k not in ("dbb", "dbbp3", "spddetail", "gcctx")])  # dbb and rep both rewrite the neck 3x3 convs
+    m = apply(copy.deepcopy(base), [k for k in ADD if k not in ("dbb", "dbbp3", "spddetail", "gcctx") + ROUND3 + tuple(ROUND4)])  # dbb and rep both rewrite the neck 3x3 convs
     assert torch.allclose(m.eval()(x)[0], ref, atol=1e-4), "not identical to the pretrained model at step 0"
     for p in m.parameters():  # move off the zero init so that fusing is actually tested
         if p.abs().sum() == 0:
@@ -425,20 +796,28 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     assert all(q.grad is not None for k in r.modules() if isinstance(k, DBB) for q in k.bn1.parameters())
     print("dbb ok: branched convs", n_dbb, "deployed params", sum(q.numel() for q in fz.parameters()))
     film_fused = sum(q.numel() for q in apply(copy.deepcopy(base), ["film"]).fuse(verbose=False).parameters())
-    for name, kept in (("dbbp3", ()), ("spddetail", ("spd",)), ("coordatt", ("coordatt",)), ("gcctx", ("gc",))):
-        r = apply(copy.deepcopy(base), ["film", "mix", "cons", name]).eval()
-        assert torch.allclose(r(x)[0], ref, atol=1e-4), f"{name}: not identical at step 0"
+    for name, kept in (("dbbp3", ()), ("spddetail", ("spd",)), ("coordatt", ("coordatt",)), ("gcctx", ("gc",)),
+                       *((k, ("coordatt", k)) for k in ROUND3), *((k, ("coordatt", a)) for k, a in ROUND4.items())):
+        on_s4 = name in ROUND3 or name in ROUND4
+        r = apply(copy.deepcopy(base), ["film", "mix", "cons"] + (["coordatt"] if on_s4 else []) + [name]).eval()
+        n_ref = ref.shape[-1]
+        cut = (lambda t: t[..., -n_ref:]) if name == "p2" else (lambda t: t)  # p2 prepends its anchors
+        assert torch.allclose(cut(r(x)[0]), ref, atol=1e-4), f"{name}: not identical at step 0"
+        if name == "p2":  # and its class scores cannot reach any confidence threshold
+            assert r(x)[0][:, 4:, :-n_ref].max() < 1e-9
         r.train()
         with torch.no_grad():
             for _ in range(3):
                 r(torch.rand(2, 3, 256, 256))
         r.tap.feats = None
+        if hasattr(r, "phase"):
+            r.phase.aux = []
         r.eval()
         for q in r.parameters():
             if q.abs().sum() == 0:
                 nn.init.normal_(q, std=0.05)
         out = r(x)[0]
-        assert not torch.allclose(out, ref, atol=1e-3), name
+        assert not torch.allclose(cut(out), ref, atol=1e-3), name
         buf = io.BytesIO()
         torch.save(r, buf)
         buf.seek(0)
@@ -446,16 +825,23 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
         fz = copy.deepcopy(r).fuse(verbose=False)
         assert torch.allclose(fz(x)[0], out, atol=1e-3, rtol=1e-3), (name, (fz(x)[0] - out).abs().max())
         extra = sum(q.numel() for k in kept for q in getattr(fz, k).parameters())
+        if name == "p2":  # the level-0 heads live inside Detect (one2one branch after fuse)
+            extra += sum(q.numel() for h in (fz.model[-1].cv2[0], fz.model[-1].cv3[0]) for q in h.parameters())
         assert sum(q.numel() for q in fz.parameters()) == film_fused + extra, f"{name}: deployed size"
         hf = copy.deepcopy(r).half().fuse(verbose=False)
         assert torch.allclose(hf(x.half())[0].float(), out, atol=5e-2, rtol=5e-2), f"{name}: half + fuse"
         r.args = get_cfg()
         r.train()
+        if name == "p2":  # past the warm-up the class offset is 0, so the level actually trains
+            assert float(r.p2.offset()) < -29.9
+            r.p2.seen.fill_(r.p2.warm)
+            assert float(r.p2.offset()) == 0.0
         for q in r.parameters():
             q.requires_grad_(True)
         loss, _ = r.loss(batch)
         loss.sum().backward()
         for k in kept:
             assert all(q.grad is not None and q.grad.abs().sum() > 0 for q in getattr(r, k).parameters()), (name, k)
+        assert r.tap.feats is None and (not hasattr(r, "phase") or (r.phase.aux == [] and not r.phase.shift)), name
         print(f"{name} ok: deployed params {sum(q.numel() for q in fz.parameters())} (+{extra} kept over film)")
     print("mods self-check ok", SimpleNamespace(loss=float(loss.sum())))
