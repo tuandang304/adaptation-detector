@@ -9,6 +9,10 @@ Every change leaves the network equal to the pretrained one at step 0 (new branc
   mix   training only: per-sample feature statistics of L1 and L3 are mixed with another sample of the batch
   cons  training only: a photometrically jittered second view must give the same Detect input features
 
+  dbb   every plain 3x3 conv (groups 1) inside L2, L4, L6, L8, L13, L16, L19, L22 and the stride-2 convs L5, L7, L17,
+        L20 gain three Diverse-Branch-Block branches (1x1; 1x1 -> 3x3; 1x1 -> avgpool3), each ending in a BatchNorm with
+        weight 0; fuse() folds them into the single 3x3 conv, so the deployed network has the stock layers and cost
+
 Hooks are module-level callables so that checkpoints (pickled models) and the EMA deep copy keep them.
 """
 from __future__ import annotations
@@ -17,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics.models.yolo.detect import DetectionTrainer
-from ultralytics.nn.modules import C3k2, Conv, RepConv
+from ultralytics.nn.modules import C3k2, Conv, Conv2, RepConv
 from ultralytics.nn.tasks import DetectionModel
 
 NECK, BACKBONE, FILM_LAYERS, MIX_LAYERS = (13, 16, 19, 22), (2, 4, 6, 8), (0, 1, 3), (1, 3)
@@ -166,7 +170,71 @@ def add_cons(model: nn.Module) -> None:
     model.model[-1].register_forward_pre_hook(model.tap)
 
 
-ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons}
+# --- dbb ---------------------------------------------------------------------------------------------------------
+DBB_INNER, DBB_DOWN = (2, 4, 6, 8, 13, 16, 19, 22), (5, 7, 17, 20)
+
+
+def _fold(w: torch.Tensor, bn: nn.BatchNorm2d, b: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    t = bn.weight.float() / (bn.running_var.float() + bn.eps).sqrt()
+    b = torch.zeros_like(bn.bias, dtype=torch.float32) if b is None else b.float()
+    return w.float() * t[:, None, None, None], bn.bias.float() + (b - bn.running_mean.float()) * t
+
+
+class DBB(Conv2):
+    """A pretrained 3x3 Conv plus three zero-gated training branches; a Conv2 so that BaseModel.fuse() calls fuse_convs."""
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)) + self.bn1(self.b1(x)) + self.bn2(self.b2b(self.b2a(x)))
+                        + self.bn3(self.pool(self.b3(x))))
+
+    def fuse_convs(self):
+        """Fold every branch (and the main BatchNorm) into one 3x3 conv with bias; leave an identity BatchNorm behind,
+        which BaseModel.fuse() then folds away with Conv.forward_fuse."""
+        w0, b0 = _fold(self.conv.weight, self.bn, self.conv.bias)
+        w1, b1 = _fold(F.pad(self.b1.weight, [1, 1, 1, 1]), self.bn1)
+        w2, b2 = _fold(torch.einsum("omhw,mi->oihw", self.b2b.weight.float(), self.b2a.weight[:, :, 0, 0].float()), self.bn2)
+        w3, b3 = _fold(self.b3.weight.float().expand(-1, -1, 3, 3) / 9, self.bn3)
+        c = self.conv
+        conv = nn.Conv2d(c.in_channels, c.out_channels, 3, c.stride, 1, bias=True).to(c.weight.device)
+        conv.weight.data, conv.bias.data = (w0 + w1 + w2 + w3).to(c.weight.dtype), (b0 + b1 + b2 + b3).to(c.weight.dtype)
+        self.conv = conv
+        bn = self.bn
+        bn.weight.data.fill_(1)
+        bn.bias.data.zero_()
+        bn.running_mean.zero_()
+        bn.running_var.fill_(1 - bn.eps)
+        for n in ("b1", "bn1", "b2a", "b2b", "bn2", "b3", "pool", "bn3"):
+            delattr(self, n)
+        self.forward = super(Conv2, self).forward
+
+
+def to_dbb(m: Conv) -> None:
+    ci, co, s = m.conv.in_channels, m.conv.out_channels, m.conv.stride
+    dev = m.conv.weight.device
+    m.__class__ = DBB
+    m.b1 = nn.Conv2d(ci, co, 1, s, 0, bias=False)
+    m.b2a, m.b2b = nn.Conv2d(ci, ci, 1, bias=False), nn.Conv2d(ci, co, 3, s, 1, bias=False)
+    nn.init.dirac_(m.b2a.weight)  # the 1x1 before the 3x3 starts as identity (as in DBB)
+    m.b3, m.pool = nn.Conv2d(ci, co, 1, bias=False), nn.AvgPool2d(3, s, 1, count_include_pad=True)
+    m.bn1, m.bn2, m.bn3 = nn.BatchNorm2d(co), nn.BatchNorm2d(co), nn.BatchNorm2d(co)
+    for bn in (m.bn1, m.bn2, m.bn3):
+        nn.init.zeros_(bn.weight)  # every branch adds 0 at step 0
+    for k in ("b1", "b2a", "b2b", "b3", "bn1", "bn2", "bn3"):
+        getattr(m, k).to(dev)
+
+
+def add_dbb(model: nn.Module) -> None:
+    assert not any(isinstance(k, RepConv) for k in model.modules()), "dbb and rep rewrite the same convs; use one"
+    is3 = lambda c: type(c) is Conv and c.conv.kernel_size == (3, 3) and c.conv.groups == 1
+    for i in DBB_INNER:
+        for c in [c for c in model.model[i].modules() if is3(c)]:
+            to_dbb(c)
+    for i in DBB_DOWN:
+        assert is3(model.model[i]) and model.model[i].conv.stride == (2, 2), i
+        to_dbb(model.model[i])
+
+
+ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons, "dbb": add_dbb}
 
 
 def apply(model: nn.Module, mods: list[str]) -> nn.Module:
@@ -205,7 +273,7 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     base = YOLO("yolo26n.pt").model.float().eval()
     x = torch.rand(2, 3, 256, 256)
     ref = base(x)[0]
-    m = apply(copy.deepcopy(base), list(ADD))
+    m = apply(copy.deepcopy(base), [k for k in ADD if k != "dbb"])  # dbb and rep both rewrite the neck 3x3 convs
     assert torch.allclose(m.eval()(x)[0], ref, atol=1e-4), "not identical to the pretrained model at step 0"
     for p in m.parameters():  # move off the zero init so that fusing is actually tested
         if p.abs().sum() == 0:
@@ -232,4 +300,38 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     loss.sum().backward()
     assert m.tap.feats is None and m.film.ab is None
     assert all(p.grad is not None for p in m.film.parameters()), "film received no gradient"
+    # dbb on top of film + mix + cons: identity at step 0; fused = unfused; fused cost = stock + film; half; checkpoint
+    r = apply(copy.deepcopy(base), ["film", "mix", "cons", "dbb"]).eval()
+    n_dbb = sum(isinstance(k, DBB) for k in r.modules())
+    assert torch.allclose(r(x)[0], ref, atol=1e-4), "dbb: not identical at step 0"
+    r.train()
+    with torch.no_grad():  # move BatchNorm statistics off their initial values so that folding them is tested
+        for _ in range(3):
+            r(torch.rand(2, 3, 256, 256))
+    r.tap.feats = None
+    r.eval()
+    for q in r.parameters():
+        if q.abs().sum() == 0:
+            nn.init.normal_(q, std=0.05)
+    out = r(x)[0]
+    assert not torch.allclose(out, ref, atol=1e-3)
+    buf = io.BytesIO()
+    torch.save(r, buf)
+    buf.seek(0)
+    assert torch.allclose(torch.load(buf, weights_only=False).eval()(x)[0], out, atol=1e-5), "dbb: checkpoint"
+    fz = copy.deepcopy(r).fuse(verbose=False)
+    assert torch.allclose(fz(x)[0], out, atol=1e-3, rtol=1e-3), (fz(x)[0] - out).abs().max()
+    assert not any(hasattr(k, "b1") or hasattr(k, "bn") and isinstance(k, DBB) for k in fz.modules())
+    ref_fused = apply(copy.deepcopy(base), ["film"]).fuse(verbose=False)
+    assert sum(q.numel() for q in fz.parameters()) == sum(q.numel() for q in ref_fused.parameters()), "dbb: deployed size"
+    hf = copy.deepcopy(r).half().fuse(verbose=False)
+    assert torch.allclose(hf(x.half())[0].float(), out, atol=5e-2, rtol=5e-2), "dbb: half + fuse"
+    r.args = get_cfg()
+    r.train()
+    for q in r.parameters():
+        q.requires_grad_(True)
+    loss, _ = r.loss(batch)
+    loss.sum().backward()
+    assert all(q.grad is not None for k in r.modules() if isinstance(k, DBB) for q in k.bn1.parameters())
+    print("dbb ok: branched convs", n_dbb, "deployed params", sum(q.numel() for q in fz.parameters()))
     print("mods self-check ok", SimpleNamespace(loss=float(loss.sum())))
