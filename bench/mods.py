@@ -604,7 +604,8 @@ def add_dynconv(model: nn.Module) -> None:
     assert not any(isinstance(q, (DBB, RepConv)) for q in model.modules()), "dynconv rewrites the same convs as dbb/rep"
     convs = [q for i in (6, 8) for q in model.model[i].modules()
              if type(q) is Conv and q.conv.kernel_size == (3, 3) and q.conv.groups == 1] + [model.model[7]]
-    model.dyn = nn.ModuleList(nn.ModuleList([d.route, d.dB, d.dA]) for d in map(to_dyn, convs))
+    for c in convs:  # not also registered elsewhere: a second path would make ModelEMA update them twice per step
+        to_dyn(c)
 
 
 class P2Level(nn.Module):
@@ -691,7 +692,7 @@ def add_dysample(model: nn.Module) -> None:
 
 
 ROUND3 = ("fusegate", "crossalign", "ndn", "sorc")
-ROUND4 = {"dynconv": "dyn", "p2": "p2", "dysample": "dysample"}  # mod -> attribute holding its modules
+ROUND4 = {"dynconv": None, "p2": "p2", "dysample": "dysample"}  # mod -> attribute holding its modules
 ADD = {"rep": add_rep, "lk": add_lk, "film": add_film, "mix": add_mix, "cons": add_cons, "dbb": add_dbb,
        "dbbp3": add_dbbp3, "spddetail": add_spddetail, "coordatt": add_coordatt, "gcctx": add_gcctx,
        "fusegate": add_fusegate, "crossalign": add_crossalign, "ndn": add_ndn, "sorc": add_sorc,
@@ -797,7 +798,7 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
     print("dbb ok: branched convs", n_dbb, "deployed params", sum(q.numel() for q in fz.parameters()))
     film_fused = sum(q.numel() for q in apply(copy.deepcopy(base), ["film"]).fuse(verbose=False).parameters())
     for name, kept in (("dbbp3", ()), ("spddetail", ("spd",)), ("coordatt", ("coordatt",)), ("gcctx", ("gc",)),
-                       *((k, ("coordatt", k)) for k in ROUND3), *((k, ("coordatt", a)) for k, a in ROUND4.items())):
+                       *((k, ("coordatt", k)) for k in ROUND3), *((k, ("coordatt",) + ((a,) if a else ())) for k, a in ROUND4.items())):
         on_s4 = name in ROUND3 or name in ROUND4
         r = apply(copy.deepcopy(base), ["film", "mix", "cons"] + (["coordatt"] if on_s4 else []) + [name]).eval()
         n_ref = ref.shape[-1]
@@ -825,6 +826,9 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
         fz = copy.deepcopy(r).fuse(verbose=False)
         assert torch.allclose(fz(x)[0], out, atol=1e-3, rtol=1e-3), (name, (fz(x)[0] - out).abs().max())
         extra = sum(q.numel() for k in kept for q in getattr(fz, k).parameters())
+        dyn = lambda mm: [q for k in mm.modules() if isinstance(k, DynConv) for n in ("route", "dB", "dA") for q in getattr(k, n).parameters()]
+        if name == "dynconv":  # its parts live inside the converted convs
+            extra += sum(q.numel() for q in dyn(fz))
         if name == "p2":  # the level-0 heads live inside Detect (one2one branch after fuse)
             extra += sum(q.numel() for h in (fz.model[-1].cv2[0], fz.model[-1].cv3[0]) for q in h.parameters())
         assert sum(q.numel() for q in fz.parameters()) == film_fused + extra, f"{name}: deployed size"
@@ -842,6 +846,9 @@ if __name__ == "__main__":  # self-check: identity at step 0, fuse, checkpoint r
         loss.sum().backward()
         for k in kept:
             assert all(q.grad is not None and q.grad.abs().sum() > 0 for q in getattr(r, k).parameters()), (name, k)
+        if name == "dynconv":
+            assert len(dyn(r)) == 4 * 9 and all(q.grad is not None and q.grad.abs().sum() > 0 for q in dyn(r)), name
+            assert len(r.state_dict()) == len({id(v) for v in r.state_dict().values()}), "a tensor is registered twice"
         assert r.tap.feats is None and (not hasattr(r, "phase") or (r.phase.aux == [] and not r.phase.shift)), name
         print(f"{name} ok: deployed params {sum(q.numel() for q in fz.parameters())} (+{extra} kept over film)")
     print("mods self-check ok", SimpleNamespace(loss=float(loss.sum())))
