@@ -1,0 +1,12 @@
+# M10-D-StaticCtrl: M10-C with input conditioning severed (learned constants, same params/FLOPs) + Div-Ldet
+smoke: false
+data_dir: /tmp/bench_data
+model: yolo26n
+epochs: 30
+imgsz: 640
+seed: 0
+eval_splits: [valid, night, nightrain, duskrain, dayrain]
+shift_eval: false
+mods: [divdet, film, condroute, staticroute]
+gpu_plan: [[bdd]]
+extra: {optimizer: MuSGD, lr0: 0.01, lrf: 0.01, momentum: 0.9, warmup_bias_lr: 0.0}

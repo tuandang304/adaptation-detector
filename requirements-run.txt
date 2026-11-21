@@ -1,0 +1,5 @@
+# Pinned top-level packages; torch/torchvision come from the execution image (recorded in env.json / pip_freeze.txt).
+ultralytics==8.4.192
+pycocotools==2.0.11
+kagglehub>=0.3.12
+pyyaml>=6
