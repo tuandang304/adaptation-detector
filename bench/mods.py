@@ -512,27 +512,29 @@ class StyleNullProj(nn.Module):
     @torch.no_grad()
     def update_cov(self, f_clean: list[torch.Tensor], f_div: list[torch.Tensor]) -> None:
         m = 1.0 if int(self.seen.item()) == 0 else 0.02
-        for i, (fc, fd) in enumerate(zip(f_clean, f_div)):
-            d = fd.detach().float().mean((2, 3)) - fc.detach().float().mean((2, 3))  # (B, C)
-            cov_b = (d.t() @ d) / max(d.shape[0], 1)
-            getattr(self, f"cov_{i}").lerp_(cov_b, m)
+        with torch.amp.autocast(device_type=f_clean[0].device.type, enabled=False):
+            for i, (fc, fd) in enumerate(zip(f_clean, f_div)):
+                d = fd.detach().float().mean((2, 3)) - fc.detach().float().mean((2, 3))  # (B, C)
+                cov_b = ((d.t() @ d) / max(d.shape[0], 1)).float()
+                getattr(self, f"cov_{i}").lerp_(cov_b, m)
         self.seen.add_(1)
 
     @torch.no_grad()
     def update_basis(self) -> None:
         if int(self.seen.item()) == 0:
             return
-        for i, ki in enumerate(self.ks):
-            cov = getattr(self, f"cov_{i}").float()
-            cov = 0.5 * (cov + cov.t())
-            evals, evecs = torch.linalg.eigh(cov)
-            u_new = evecs[:, -ki:].contiguous()
-            u_buf = getattr(self, f"u_{i}")
-            if u_buf.abs().sum() > 0:
-                flip = (u_buf.float() * u_new).sum(dim=0) < 0
-                if flip.any():
-                    u_new[:, flip] *= -1.0
-            u_buf.copy_(u_new.to(u_buf.dtype))
+        with torch.amp.autocast(device_type=self.alpha.device.type, enabled=False):
+            for i, ki in enumerate(self.ks):
+                cov = getattr(self, f"cov_{i}").float()
+                cov = 0.5 * (cov + cov.t())
+                evals, evecs = torch.linalg.eigh(cov)
+                u_new = evecs[:, -ki:].contiguous()
+                u_buf = getattr(self, f"u_{i}")
+                if u_buf.abs().sum() > 0:
+                    flip = (u_buf.float() * u_new).sum(dim=0) < 0
+                    if flip.any():
+                        u_new[:, flip] *= -1.0
+                u_buf.copy_(u_new.to(u_buf.dtype))
 
     @torch.no_grad()
     def set_epoch(self, epoch: int) -> None:
@@ -666,6 +668,16 @@ class PAMRLite(nn.Module):
         return outs
 
     def compute_loss(
+        self,
+        z1_list: list[torch.Tensor],
+        z2_list: list[torch.Tensor],
+        fg_mask: torch.Tensor,
+        target_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.amp.autocast(device_type=z1_list[0].device.type, enabled=False):
+            return self._compute_loss_fp32(z1_list, z2_list, fg_mask, target_labels)
+
+    def _compute_loss_fp32(
         self,
         z1_list: list[torch.Tensor],
         z2_list: list[torch.Tensor],
@@ -1071,7 +1083,8 @@ if __name__ == "__main__":  # exhaustive self-check for all 4 Round-12 configs (
             fake_tr.epoch = 4 if step == 1 else 0  # test alpha ramp on step 1
             on_r12_epoch_start(fake_tr)
             opt.zero_grad()
-            loss, _ = rt.loss(batch)
+            with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
+                loss, _ = rt.loss(batch)
             assert torch.isfinite(loss).all(), f"{label}: non-finite loss step {step}"
             loss.sum().backward()
             opt.step()
