@@ -25,14 +25,54 @@ def env_info() -> dict:
             "ultralytics": ultralytics.__version__, "nproc": os.cpu_count(), "platform": platform.platform()}
 
 
-def evaluate_ckpt(tag: str, ckpt: str, root: Path, imgsz: int, splits: list[str], device: str, out: Path) -> dict:
+def _pool_eval(split_items: list[tuple[str, dict, dict, list[dict]]]) -> tuple[dict, dict]:
+    """Single ignore-aware COCOeval over all shifted images pooled together (removes small-split distortion)."""
+    from . import evaluate
+
+    pooled_gt: dict = {"images": [], "annotations": [], "categories": split_items[0][1]["categories"]}
+    pooled_ign: dict = {}
+    pooled_dets: list[dict] = []
+    next_ann_id = 1
+    for idx, (_split, gt, ign, dets) in enumerate(split_items):
+        off = (idx + 1) * 1_000_000
+        for im in gt["images"]:
+            pooled_gt["images"].append({**im, "id": int(im["id"]) + off})
+        for ann in gt["annotations"]:
+            pooled_gt["annotations"].append({**ann, "id": next_ann_id, "image_id": int(ann["image_id"]) + off})
+            next_ann_id += 1
+        for k, v in ign.items():
+            pooled_ign[str(int(k) + off)] = v
+        for d in dets:
+            pooled_dets.append({**d, "image_id": int(d["image_id"]) + off})
+    return evaluate.coco_eval(pooled_gt, pooled_dets), evaluate.coco_eval(pooled_gt, pooled_dets, ignore=pooled_ign)
+
+
+def evaluate_ckpt(
+    tag: str,
+    ckpt: str,
+    root: Path,
+    imgsz: int,
+    splits: list[str],
+    device: str,
+    out: Path,
+    export_gt: bool = False,
+    causal_eval: bool = False,
+) -> dict:
     """Score a checkpoint with the unified evaluator; detections are kept so a model can be rescored later."""
     from . import data as D, efficiency, evaluate, predict
+
     pred = predict.load_predictor(ckpt, D.names_of(root), device=device)
     res: dict = {"tag": tag, "ckpt": ckpt, "metrics": {}}
+    pooled_items: list[tuple[str, dict, dict, list[dict]]] = []
+    if export_gt:
+        (out / "gt").mkdir(parents=True, exist_ok=True)
     for split in splits:
-        gt = json.loads((root / f"coco_{split}.json").read_text())
-        ign = json.loads((root / f"ignore_{split}.json").read_text())
+        gt_path, ign_path = root / f"coco_{split}.json", root / f"ignore_{split}.json"
+        gt = json.loads(gt_path.read_text())
+        ign = json.loads(ign_path.read_text())
+        if export_gt:
+            (out / "gt" / f"coco_{split}.json").write_text(gt_path.read_text())
+            (out / "gt" / f"ignore_{split}.json").write_text(ign_path.read_text())
         t0 = time.time()
         dets = predict.predict_split(pred, root, split, imgsz, gt)
         with gzip.open(out / f"dets_{tag}_{split}_{imgsz}.json.gz", "wt") as f:
@@ -40,9 +80,36 @@ def evaluate_ckpt(tag: str, ckpt: str, root: Path, imgsz: int, splits: list[str]
         m, mi = evaluate.coco_eval(gt, dets), evaluate.coco_eval(gt, dets, ignore=ign)
         res["metrics"][f"{split}@{imgsz}"] = {"std": m, "ignore_aware": mi, "infer_sec": round(time.time() - t0, 1)}
         print(f"[eval] {tag} {split}@{imgsz}: {evaluate.fmt(mi)} | std mAP50_95={m['mAP50_95']:.2f}", flush=True)
+        if split not in ("valid", "test"):
+            pooled_items.append((split, gt, ign, dets))
+    if len(pooled_items) >= 2:
+        mp, mip = _pool_eval(pooled_items)
+        res["metrics"][f"pooled_shift@{imgsz}"] = {"std": mp, "ignore_aware": mip}
+        res["pooled_shift_mAP50_95"] = mip["mAP50_95"]
+        print(f"[eval] {tag} pooled_shift@{imgsz}: {evaluate.fmt(mip)} | std mAP50_95={mp['mAP50_95']:.2f}", flush=True)
     res["efficiency"] = efficiency.params_flops(pred.torch_module(), imgsz)
     if device != "cpu":
         res["efficiency"].update(efficiency.latency(pred, str(next((root / "valid" / "images").iterdir())), imgsz))
+    if causal_eval and pooled_items:
+        pred_z = predict.load_predictor(ckpt, D.names_of(root), device=device)
+        tm = pred_z.torch_module()
+        if hasattr(tm, "zero_new_weights"):
+            tm.zero_new_weights()
+            z_items, z_splits = [], {}
+            for split, gt, ign, _ in pooled_items:
+                zdets = predict.predict_split(pred_z, root, split, imgsz, gt)
+                _, zmi = evaluate.coco_eval(gt, zdets), evaluate.coco_eval(gt, zdets, ignore=ign)
+                z_splits[split] = zmi["mAP50_95"]
+                z_items.append((split, gt, ign, zdets))
+            _, zmip = _pool_eval(z_items)
+            full_p = res.get("pooled_shift_mAP50_95", 0.0)
+            drop = round(full_p - zmip["mAP50_95"], 3)
+            res["causal_ablation"] = {
+                "zero_pooled_shift_mAP50_95": zmip["mAP50_95"],
+                "pooled_drop": drop,
+                "zero_splits": z_splits,
+            }
+            print(f"[causal] {tag} full_pooled={full_p:.3f} zero_pooled={zmip['mAP50_95']:.3f} drop={drop:+.3f} splits={z_splits}", flush=True)
     return res
 
 
@@ -67,7 +134,11 @@ def run_dataset(cfg: dict, name: str, gpu: int) -> dict:
         t0 = time.time()
         shifted = shift.make(root)
         print(f"[data] ds={name} shifted splits {shifted} ready in {time.time() - t0:.0f}s", flush=True)
-    res = evaluate_ckpt(tag, ckpt, root, cfg["imgsz"], cfg.get("eval_splits", ["valid"]) + shifted, device, out)
+    res = evaluate_ckpt(
+        tag, ckpt, root, cfg["imgsz"], cfg.get("eval_splits", ["valid"]) + shifted, device, out,
+        export_gt=bool(cfg.get("export_gt", False)),
+        causal_eval=bool(cfg.get("causal_eval", False)),
+    )
     res.update(dataset=name, train=info, manifest=json.loads((root / "manifest.json").read_text())["splits"])
     m = res["metrics"][f"valid@{cfg['imgsz']}"]["ignore_aware"]
     # every scored split other than the source validation set counts as shifted (synthetic valid_* or real ones)
@@ -77,7 +148,10 @@ def run_dataset(cfg: dict, name: str, gpu: int) -> dict:
     (out / "result.json").write_text(json.dumps(res, indent=2))
     print("[result] " + json.dumps({"dataset": name, "model": cfg["model"], "epochs": cfg["epochs"], "seed": cfg["seed"],
                                     "mods": cfg.get("mods", []), "mAP50_95": m["mAP50_95"],
-                                    "shift_mAP50_95": res["shift_mAP50_95"], "shift": sh, "mAP50": m["mAP50"], "AP_small": m["AP_small"],
+                                    "shift_mAP50_95": res["shift_mAP50_95"],
+                                    "pooled_shift_mAP50_95": res.get("pooled_shift_mAP50_95"),
+                                    "causal_ablation": res.get("causal_ablation"),
+                                    "shift": sh, "mAP50": m["mAP50"], "AP_small": m["AP_small"],
                                     "AP_medium": m["AP_medium"], "AP_large": m["AP_large"], **res["efficiency"],
                                     "train_hours": info["train_hours"], "ckpt": ckpt}), flush=True)
     return res
@@ -120,7 +194,10 @@ def main() -> None:
             else:
                 rcs = [subprocess.call(cmd + ["--only", ",".join(ds), "--gpu", "0"]) for ds in cfg["gpu_plan"]]
             done = {p.parent.name: json.loads(p.read_text()) for p in sorted(OUT.glob("*/result.json"))}
-            summary["results"] = {k: {"metrics": v["metrics"], "shift_mAP50_95": v["shift_mAP50_95"], "efficiency": v["efficiency"], "train": v["train"],
+            summary["results"] = {k: {"metrics": v["metrics"], "shift_mAP50_95": v["shift_mAP50_95"],
+                                      "pooled_shift_mAP50_95": v.get("pooled_shift_mAP50_95"),
+                                      "causal_ablation": v.get("causal_ablation"),
+                                      "efficiency": v["efficiency"], "train": v["train"],
                                       "manifest": v["manifest"]} for k, v in done.items()}
             if any(rcs):
                 raise RuntimeError(f"dataset process exit codes {rcs}; finished: {sorted(done)}")
