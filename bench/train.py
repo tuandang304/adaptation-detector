@@ -34,6 +34,10 @@ def train(model: str, tag: str, data_root: Path, out: Path, epochs: int, imgsz: 
         print(f"[epoch {tr.epoch + 1}/{tr.epochs}] ds={tag} loss {loss} | val map={m.get('metrics/mAP50-95(B)', float('nan')):.4f} "
               f"map50={m.get('metrics/mAP50(B)', float('nan')):.4f} | lr={tr.optimizer.param_groups[0]['lr']:.5f} | "
               f"{dt:.0f}s eta={left:.0f}m mem={mem:.1f}G", flush=True)
+        if (tr.epoch + 1) in (1, 10, 20, tr.epochs) and hasattr(tr.model, "liveness_report"):
+            rep = tr.model.liveness_report()
+            if rep:
+                print(f"[liveness] ep={tr.epoch + 1} " + " ".join(f"{k}={v:.4f}" for k, v in rep.items()), flush=True)
 
     y.add_callback("on_train_start", on_train_start)
     y.add_callback("on_fit_epoch_end", on_fit_epoch_end)
