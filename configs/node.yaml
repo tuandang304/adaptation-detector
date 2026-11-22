@@ -1,14 +1,14 @@
-# M10-A-Control: stock YOLO26n + Div-Ldet + dual-head output alignment, BDD100K daytime+clear only
+# R12-SN-StyleNull: Cluster 2'' cls-only paired-view rank-4 style-nullspace projection + Div-Ldet
 smoke: false
 data_dir: /tmp/bench_data
 model: yolo26n
 epochs: 30
 imgsz: 640
 seed: 0
-eval_splits: [valid, night, nightrain, duskrain, dayrain]   # real conditions unseen in training
-shift_eval: false      # real shifted sets instead of synthetic degradations
-mods: [divdet]
-# one list per GPU, trained in order; on a single-GPU host the lists run one after another
+eval_splits: [valid, night, nightrain, duskrain, dayrain]
+shift_eval: false
+export_gt: false
+causal_eval: true
+mods: [divdet, stylenull]
 gpu_plan: [[bdd]]
-# written out instead of optimizer=auto so that every dataset gets the same optimizer whatever its iteration count
 extra: {optimizer: MuSGD, lr0: 0.01, lrf: 0.01, momentum: 0.9, warmup_bias_lr: 0.0}

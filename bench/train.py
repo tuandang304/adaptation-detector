@@ -34,12 +34,20 @@ def train(model: str, tag: str, data_root: Path, out: Path, epochs: int, imgsz: 
         print(f"[epoch {tr.epoch + 1}/{tr.epochs}] ds={tag} loss {loss} | val map={m.get('metrics/mAP50-95(B)', float('nan')):.4f} "
               f"map50={m.get('metrics/mAP50(B)', float('nan')):.4f} | lr={tr.optimizer.param_groups[0]['lr']:.5f} | "
               f"{dt:.0f}s eta={left:.0f}m mem={mem:.1f}G", flush=True)
+        if (tr.epoch + 1) in (1, 3, 4, 10, 20, tr.epochs):
+            target = tr.ema.ema if (getattr(tr, "ema", None) is not None and tr.ema.enabled) else tr.model
+            if hasattr(target, "diag_report"):
+                rep = target.diag_report()
+                if rep:
+                    print(f"[r12diag] ep={tr.epoch + 1} " + " ".join(f"{k}={v:.4f}" for k, v in rep.items()), flush=True)
 
     y.add_callback("on_train_start", on_train_start)
     y.add_callback("on_fit_epoch_end", on_fit_epoch_end)
     print(f"[train] ds={tag} {kw}", flush=True)
     if mods:  # the trainer rebuilds the model from its yaml, so the changes are applied inside it
-        from .mods import ModTrainer
+        from .mods import ModTrainer, on_r12_epoch_end, on_r12_epoch_start
+        y.add_callback("on_train_epoch_start", on_r12_epoch_start)
+        y.add_callback("on_train_epoch_end", on_r12_epoch_end)
         ModTrainer.mods = list(mods)
         y.train(trainer=ModTrainer, **kw)
     else:

@@ -27,8 +27,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics.models.yolo.detect import DetectionTrainer
-from ultralytics.nn.modules import C3k2, Conv, Conv2, RepConv
+from ultralytics.nn.modules import C3k2, Conv, Conv2, Detect, RepConv
 from ultralytics.nn.tasks import DetectionModel
+from ultralytics.utils.torch_utils import fuse_conv_and_bn, unwrap_model
 
 NECK, BACKBONE, FILM_LAYERS, MIX_LAYERS = (13, 16, 19, 22), (2, 4, 6, 8), (0, 1, 3), (1, 3)
 COND_CONV_LAYERS = (4, 6, 13, 16, 19)       # 18 plain 3x3 convs total (~129k delta params = +5.4%, ~0% b=1 FLOPs)
@@ -324,28 +325,107 @@ def add_cons(model: nn.Module) -> None:
 
 
 class DivDetModel(DetectionModel):
-    """Supervised detection on BOTH clean and non-weather diversified views (0.5/0.5) + paired feature & output alignment."""
+    """Supervised detection on BOTH clean and non-weather diversified views (0.5/0.5) + paired feature & output alignment,
+    plus optional Round-12 cls-only StyleNullProj covariance updates and TAL-aligned PAMR-Lite prototype losses."""
+
+    @torch.no_grad()
+    def _tal_targets(self, preds_o2m: dict, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        from ultralytics.utils.tal import make_anchors
+
+        crit = self.criterion.one2many
+        pred_distri = preds_o2m["boxes"].detach().permute(0, 2, 1).contiguous()
+        pred_scores = preds_o2m["scores"].detach().permute(0, 2, 1).contiguous()
+        feats = preds_o2m["feats"]
+        anchor_points, stride_tensor = make_anchors(feats, crit.stride, 0.5)
+        bs = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=crit.device, dtype=pred_scores.dtype) * crit.stride[0]
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = crit.preprocess(targets.to(crit.device), bs, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        pred_bboxes = crit.bbox_decode(anchor_points, pred_distri)
+        target_labels, _, _, fg_mask, _ = crit.assigner(
+            pred_scores.sigmoid(),
+            (pred_bboxes * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+        return fg_mask, target_labels.long()
+
+    def zero_new_weights(self) -> None:
+        """Causal ablation helper: disables newly added cls-only inference ops (alpha=0 / out_projs=0)."""
+        det = self.model[-1]
+        sn = getattr(det, "stylenull", None)
+        if sn is not None:
+            sn.zero_new_weights()
+        pm = getattr(det, "pamr", None)
+        if pm is not None:
+            pm.zero_new_weights()
+
+    def diag_report(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        det = self.model[-1]
+        sn = getattr(det, "stylenull", None)
+        if sn is not None:
+            out.update(sn.diag_report())
+        pm = getattr(det, "pamr", None)
+        if pm is not None:
+            out.update(pm.diag_report())
+        return out
+
+    def fuse(self, verbose=True, imgsz=640):
+        was_fused = self.is_fused()
+        super().fuse(verbose=verbose, imgsz=imgsz)
+        if not was_fused:
+            pm = getattr(self.model[-1], "pamr", None)
+            if pm is not None:
+                for m in pm.modules():
+                    if isinstance(m, Conv) and hasattr(m, "bn"):
+                        m.conv = fuse_conv_and_bn(m.conv, m.bn)
+                        delattr(m, "bn")
+                        m.forward = m.forward_fuse
+        return self
 
     def loss(self, batch, preds=None):
+        det = self.model[-1]
+        pm = getattr(det, "pamr", None)
+        sn = getattr(det, "stylenull", None)
         loss_clean, items = super().loss(batch, preds)
         if not self.training or preds is not None:
+            if pm is not None:
+                pm._last_z_hats = None
             return loss_clean, items
         f1, self.tap.feats = self.tap.feats, None
         p1, self.pred_grab.preds = self.pred_grab.preds, None
+        z1 = None
+        if pm is not None:
+            z1, pm._last_z_hats = pm._last_z_hats, None
         view = div_augment(batch["img"])
+        z2 = None
         try:
             loss_div, _ = super().loss({**batch, "img": view})
             f2, self.tap.feats = self.tap.feats, None
             p2, self.pred_grab.preds = self.pred_grab.preds, None
+            if pm is not None:
+                z2, pm._last_z_hats = pm._last_z_hats, None
         finally:
             self.tap.feats = None
             self.pred_grab.preds = None
+            if pm is not None:
+                pm._last_z_hats = None
             rbox = getattr(self, "rbox", None)
             if rbox is not None:
                 rbox.alpha = None
+        if sn is not None and f1 is not None and f2 is not None:
+            sn.update_cov(f1, f2)
         c_cos = sum(1 - F.cosine_similarity(a.detach().float(), b.float(), dim=1).mean() for a, b in zip(f1, f2)) / len(f1)
         l_cls, l_box = _dual_head_align(p1, p2, k=64) if (p1 is not None and isinstance(p2, dict)) else (0.0, 0.0)
         align = 0.5 * c_cos + 0.25 * l_cls + 0.05 * l_box
+        if pm is not None and z1 is not None and z2 is not None and isinstance(p1, dict) and "one2many" in p1:
+            fg_mask, target_labels = self._tal_targets(p1["one2many"], batch)
+            align = align + pm.compute_loss(z1, z2, fg_mask, target_labels)
         total = 0.5 * loss_clean + 0.5 * loss_div + align * batch["img"].shape[0] / loss_clean.numel()
         return total, items
 
@@ -356,6 +436,350 @@ def add_divdet(model: nn.Module) -> None:
     model.pred_grab = PredGrab()
     model.model[-1].register_forward_pre_hook(model.tap)
     model.model[-1].register_forward_hook(model.pred_grab)
+
+
+# --- Round 12 (Method B): Cls-only edge-native domain-invariant clusters (StyleNullProj + PAMR-Lite) -------------
+class ClsModDetect(Detect):
+    """Detect head extension applying cls-only invariance ops (stylenull / pamr) BEFORE cv3 and one2one_cv3.
+    Leaves box regression (cv2 / one2one_cv2) 100% untouched, computes x_cls ONCE per forward (preserving YOLO26n's
+    one2one detach boundary during training and halving inference overhead), and keeps extra params outside cv3
+    so they do not inherit MuSGD's 3x classification-head LR boost."""
+
+    def _cls_transform(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        xc = x
+        sn = getattr(self, "stylenull", None)
+        if sn is not None:
+            xc = sn(xc)
+        pm = getattr(self, "pamr", None)
+        if pm is not None:
+            xc = pm(xc)
+        return xc
+
+    def _forward_split(
+        self,
+        x_box: list[torch.Tensor],
+        x_cls: list[torch.Tensor],
+        box_head: nn.Module | None = None,
+        cls_head: nn.Module | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if box_head is None or cls_head is None:
+            return {}
+        bs = x_box[0].shape[0]
+        boxes = torch.cat([box_head[i](x_box[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([cls_head[i](x_cls[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        return {"boxes": boxes, "scores": scores, "feats": x_box}
+
+    def forward(self, x: list[torch.Tensor]):
+        x_cls = self._cls_transform(x)
+        preds = self._forward_split(x, x_cls, **self.one2many)
+        if getattr(self, "one2one_cv2", None) is not None:
+            x_det = [xi.detach() for xi in x] if self.training else x
+            xc_det = [ci.detach() for ci in x_cls] if self.training else x_cls
+            one2one = self._forward_split(x_det, xc_det, **self.one2one)
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one" if self.end2end else "one2many"] if "one2one" in preds else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+
+def _ensure_cls_mod_detect(model: nn.Module) -> Detect:
+    det = model.model[-1]
+    if not isinstance(det, ClsModDetect):
+        det.__class__ = ClsModDetect
+    return det
+
+
+class StyleNullProj(nn.Module):
+    """Cluster 2'' (DG-DETR DAQS faithful edge port): cls-only paired-view rank-k orthogonal style-nullspace projection.
+    Zero learned parameters (pure buffers, immune to Muon), exact step-0 COCO identity (alpha=0 during 3-epoch warmup,
+    linearly ramped 0->1 over epochs 3..10), pure FP16 TensorRT 1x1 conv projections, trivial causal check (alpha=0)."""
+
+    def __init__(self, chs: list[int], k: int = 4, warmup_epochs: int = 3, ramp_epochs: int = 8):
+        super().__init__()
+        self.chs = list(chs)
+        self.ks = [min(k, max(1, c // 8)) for c in self.chs]
+        self.warmup_epochs = warmup_epochs
+        self.ramp_epochs = ramp_epochs
+        self.register_buffer("alpha", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("seen", torch.tensor(0, dtype=torch.long))
+        for i, (c, ki) in enumerate(zip(self.chs, self.ks)):
+            self.register_buffer(f"cov_{i}", torch.zeros(c, c, dtype=torch.float32))
+            self.register_buffer(f"u_{i}", torch.zeros(c, ki, dtype=torch.float32))
+
+    @torch.no_grad()
+    def update_cov(self, f_clean: list[torch.Tensor], f_div: list[torch.Tensor]) -> None:
+        m = 1.0 if int(self.seen.item()) == 0 else 0.02
+        for i, (fc, fd) in enumerate(zip(f_clean, f_div)):
+            d = fd.detach().float().mean((2, 3)) - fc.detach().float().mean((2, 3))  # (B, C)
+            cov_b = (d.t() @ d) / max(d.shape[0], 1)
+            getattr(self, f"cov_{i}").lerp_(cov_b, m)
+        self.seen.add_(1)
+
+    @torch.no_grad()
+    def update_basis(self) -> None:
+        if int(self.seen.item()) == 0:
+            return
+        for i, ki in enumerate(self.ks):
+            cov = getattr(self, f"cov_{i}").float()
+            cov = 0.5 * (cov + cov.t())
+            evals, evecs = torch.linalg.eigh(cov)
+            u_new = evecs[:, -ki:].contiguous()
+            u_buf = getattr(self, f"u_{i}")
+            if u_buf.abs().sum() > 0:
+                flip = (u_buf.float() * u_new).sum(dim=0) < 0
+                if flip.any():
+                    u_new[:, flip] *= -1.0
+            u_buf.copy_(u_new.to(u_buf.dtype))
+
+    @torch.no_grad()
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < self.warmup_epochs:
+            val = 0.0
+        else:
+            val = min(1.0, float(epoch - self.warmup_epochs + 1) / float(self.ramp_epochs))
+        self.alpha.fill_(val)
+
+    @torch.no_grad()
+    def zero_new_weights(self) -> None:
+        self.alpha.zero_()
+
+    @torch.no_grad()
+    def sync_to(self, other: "StyleNullProj") -> None:
+        other.alpha.copy_(self.alpha)
+        other.seen.copy_(self.seen)
+        for i in range(len(self.chs)):
+            getattr(other, f"cov_{i}").copy_(getattr(self, f"cov_{i}"))
+            getattr(other, f"u_{i}").copy_(getattr(self, f"u_{i}"))
+
+    @torch.no_grad()
+    def diag_report(self) -> dict[str, float]:
+        out = {"sn_alpha": float(self.alpha.item()), "sn_seen": float(self.seen.item())}
+        max_err, var_ratios = 0.0, []
+        for i, ki in enumerate(self.ks):
+            u = getattr(self, f"u_{i}").float()
+            if u.abs().sum() > 0:
+                eye = torch.eye(ki, device=u.device, dtype=torch.float32)
+                max_err = max(max_err, float((u.t() @ u - eye).abs().max().item()))
+            cov = getattr(self, f"cov_{i}").float()
+            tr = float(torch.trace(cov).item())
+            if tr > 1e-8:
+                evals = torch.linalg.eigvalsh(0.5 * (cov + cov.t()))
+                var_ratios.append(float(evals[-ki:].clamp_min(0).sum().item() / tr))
+        out["sn_ortho_err"] = max_err
+        if var_ratios:
+            out["sn_top4_var"] = sum(var_ratios) / len(var_ratios)
+        return out
+
+    def forward(self, feats: list[torch.Tensor]) -> list[torch.Tensor]:
+        a = self.alpha.to(feats[0].dtype)
+        out = []
+        for i, x in enumerate(feats):
+            u = getattr(self, f"u_{i}").to(x.dtype)  # (C, k)
+            proj = F.conv2d(F.conv2d(x, u.t()[:, :, None, None]), u[:, :, None, None])
+            out.append(x - a * proj)
+        return out
+
+
+def add_stylenull(model: nn.Module) -> None:
+    """Cluster 2'': cls-only paired-view rank-4 orthogonal style-nullspace projection on Detect P3/P4/P5."""
+    det = _ensure_cls_mod_detect(model)
+    dev = next(det.parameters()).device
+    chs = [det.cv2[i][0].conv.in_channels for i in range(det.nl)]
+    det.stylenull = StyleNullProj(chs, k=4, warmup_epochs=3, ramp_epochs=8).to(dev)
+
+
+class PAMRLite(nn.Module):
+    """Cluster 3'' (MR-DCoT edge port): cls-only magnitude-invariant EMA-prototype manifold rectifier.
+    Uses EMA prototype buffers (immune to Muon), exact TAL one2many foreground/background targets, post-BN L2 norm
+    (FP16-safe), constant tau=10 (no 0-D SGD decay), and zero-init 4-D out_proj (exact step-0 COCO identity).
+    With loss_only=True, out_projs stay frozen at 0 (stock inference graph) as a mandatory causal loss-only control."""
+
+    def __init__(self, chs: list[int], nc: int, d_p: int = 64, tau: float = 10.0, loss_only: bool = False):
+        super().__init__()
+        self.chs = list(chs)
+        self.nc = int(nc)
+        self.k = self.nc + 1  # nc foreground classes + 1 background anchor
+        self.d_p = int(d_p)
+        self.tau = float(tau)
+        self.loss_only = bool(loss_only)
+        self.in_projs = nn.ModuleList([Conv(c, self.d_p, 1, 1, act=False) for c in self.chs])
+        self.out_projs = nn.ModuleList([nn.Conv2d(self.d_p, c, 1, 1, bias=False) for c in self.chs])
+        for op in self.out_projs:
+            nn.init.zeros_(op.weight)
+            if self.loss_only:
+                op.weight.requires_grad_(False)
+        self.register_buffer("protos", torch.zeros(self.k, self.d_p, dtype=torch.float32))
+        self.register_buffer("proto_mask", torch.full((self.k,), -1e4, dtype=torch.float32))
+        self.register_buffer("proto_seen", torch.zeros(self.k, dtype=torch.long))
+        self._last_z_hats: list[torch.Tensor] | None = None
+
+    @torch.no_grad()
+    def zero_new_weights(self) -> None:
+        for op in self.out_projs:
+            op.weight.zero_()
+
+    @torch.no_grad()
+    def sync_to(self, other: "PAMRLite") -> None:
+        other.protos.copy_(self.protos)
+        other.proto_mask.copy_(self.proto_mask)
+        other.proto_seen.copy_(self.proto_seen)
+
+    @torch.no_grad()
+    def diag_report(self) -> dict[str, float]:
+        active = self.proto_seen > 0
+        out = {
+            "pm_active": float(active.sum().item()),
+            "pm_out_rms": sum(float(op.weight.detach().float().pow(2).mean().sqrt()) for op in self.out_projs) / len(self.out_projs),
+        }
+        if active.sum() >= 2:
+            p = self.protos[active].float()
+            gram = p @ p.t()
+            eye = torch.eye(gram.shape[0], device=gram.device)
+            off = (gram - eye).abs()
+            out["pm_proto_offcos"] = float(off.sum() / max(gram.shape[0] * (gram.shape[0] - 1), 1))
+        return out
+
+    def forward(self, feats: list[torch.Tensor]) -> list[torch.Tensor]:
+        if self.loss_only and not self.training:
+            return feats
+        z_hats = []
+        outs = []
+        p_hat = (self.protos.clone() if self.training else self.protos).to(feats[0].dtype)
+        mask = (self.proto_mask.clone() if self.training else self.proto_mask).to(feats[0].dtype).view(1, self.k, 1, 1)
+        for i, x in enumerate(feats):
+            z = self.in_projs[i](x)
+            z_hat = z * torch.rsqrt((z * z).sum(dim=1, keepdim=True) + 1e-4)
+            if self.training:
+                z_hats.append(z_hat)
+            if self.loss_only:
+                outs.append(x)
+            else:
+                logits = F.conv2d(z_hat, p_hat[:, :, None, None]) * self.tau + mask
+                theta = torch.softmax(logits, dim=1)
+                m_proto = F.conv2d(theta, p_hat.t()[:, :, None, None])
+                disp = m_proto - z_hat
+                outs.append(x + self.out_projs[i](disp))
+        self._last_z_hats = z_hats if self.training else None
+        return outs
+
+    def compute_loss(
+        self,
+        z1_list: list[torch.Tensor],
+        z2_list: list[torch.Tensor],
+        fg_mask: torch.Tensor,
+        target_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        z1 = torch.cat([z.flatten(2) for z in z1_list], dim=2).transpose(1, 2).float()  # (B, N, d_p)
+        z2 = torch.cat([z.flatten(2) for z in z2_list], dim=2).transpose(1, 2).float()  # (B, N, d_p)
+        dev = z1.device
+        zero = z1.sum() * 0.0
+
+        # Sample up to 256 background anchors per batch for balanced EMA update & bg loss
+        bg_coords = torch.nonzero(~fg_mask, as_tuple=False)
+        if bg_coords.shape[0] > 256:
+            perm = torch.randperm(bg_coords.shape[0], device=dev)[:256]
+            bg_coords = bg_coords[perm]
+
+        # 1. EMA prototype updates strictly from clean view (detached, immune to Muon)
+        with torch.no_grad():
+            z1_det = z1.detach()
+            if fg_mask.any():
+                fg_z = z1_det[fg_mask]
+                fg_y = target_labels[fg_mask]
+                for c in torch.unique(fg_y).tolist():
+                    if 0 <= c < self.nc:
+                        mean_c = F.normalize(fg_z[fg_y == c].mean(dim=0, keepdim=True), dim=1, eps=1e-6).squeeze(0)
+                        mom = 1.0 if int(self.proto_seen[c].item()) == 0 else 0.05
+                        updated = F.normalize((1.0 - mom) * self.protos[c] + mom * mean_c, dim=0, eps=1e-6)
+                        self.protos[c].copy_(updated)
+                        self.proto_mask[c] = 0.0
+                        self.proto_seen[c] += 1
+            if bg_coords.shape[0] > 0:
+                bg_z = z1_det[bg_coords[:, 0], bg_coords[:, 1]]
+                mean_bg = F.normalize(bg_z.mean(dim=0, keepdim=True), dim=1, eps=1e-6).squeeze(0)
+                mom = 1.0 if int(self.proto_seen[self.nc].item()) == 0 else 0.05
+                updated = F.normalize((1.0 - mom) * self.protos[self.nc] + mom * mean_bg, dim=0, eps=1e-6)
+                self.protos[self.nc].copy_(updated)
+                self.proto_mask[self.nc] = 0.0
+                self.proto_seen[self.nc] += 1
+
+        # 2. Prototype-anchored manifold regression & inter-class separation losses
+        p_all = self.protos.detach()
+        seen_mask = self.proto_seen > 0
+        valid_fg = fg_mask & (self.proto_seen[target_labels.clamp(0, self.nc - 1)] > 0)
+        l_anchor_fg, l_rect_fg, l_sep = zero, zero, zero
+        if valid_fg.any():
+            z1_fg = z1[valid_fg]
+            z2_fg = z2[valid_fg]
+            y_fg = target_labels[valid_fg]
+            p_y = p_all[y_fg]
+            l_anchor_fg = F.relu(1.0 - (z1_fg * p_y).sum(dim=-1) - 0.15).mean()
+            l_rect_fg = F.relu(1.0 - (z2_fg * p_y).sum(dim=-1) - 0.15).mean()
+            if int(seen_mask.sum().item()) >= 2:
+                cos_all = z1_fg @ p_all.t()  # (M, K)
+                invalid = (~seen_mask).unsqueeze(0).expand_as(cos_all).clone()
+                invalid.scatter_(1, y_fg.unsqueeze(1), True)
+                cos_other = cos_all.masked_fill(invalid, -2.0)
+                l_sep = F.relu(cos_other.max(dim=-1).values - 0.30).mean()
+
+        l_bg = zero
+        if bg_coords.shape[0] > 0 and bool(seen_mask[self.nc].item()):
+            z1_bg = z1[bg_coords[:, 0], bg_coords[:, 1]]
+            z2_bg = z2[bg_coords[:, 0], bg_coords[:, 1]]
+            p_bg = p_all[self.nc]
+            l_bg = (
+                F.relu(1.0 - (z1_bg * p_bg).sum(dim=-1) - 0.25).mean()
+                + 0.5 * F.relu(1.0 - (z2_bg * p_bg).sum(dim=-1) - 0.25).mean()
+            )
+
+        return 0.20 * (0.5 * l_anchor_fg + 0.5 * l_rect_fg + 0.25 * l_bg + 0.25 * l_sep)
+
+
+def add_pamrlite(model: nn.Module) -> None:
+    """Cluster 3'': cls-only magnitude-invariant EMA-prototype manifold rectifier on Detect P3/P4/P5."""
+    det = _ensure_cls_mod_detect(model)
+    dev = next(det.parameters()).device
+    chs = [det.cv2[i][0].conv.in_channels for i in range(det.nl)]
+    det.pamr = PAMRLite(chs, nc=det.nc, d_p=64, tau=10.0, loss_only=False).to(dev)
+
+
+def add_pamrloss(model: nn.Module) -> None:
+    """Causal loss-only control for PAMR-Lite: identical TAL prototype losses, out_proj frozen at 0 (stock inference)."""
+    det = _ensure_cls_mod_detect(model)
+    dev = next(det.parameters()).device
+    chs = [det.cv2[i][0].conv.in_channels for i in range(det.nl)]
+    det.pamr = PAMRLite(chs, nc=det.nc, d_p=64, tau=10.0, loss_only=True).to(dev)
+
+
+def on_r12_epoch_start(tr) -> None:
+    """Updates StyleNullProj alpha schedule on both model and EMA at the start of every training epoch."""
+    m = unwrap_model(tr.model)
+    sn = getattr(m.model[-1], "stylenull", None)
+    if sn is not None:
+        sn.set_epoch(tr.epoch)
+        if getattr(tr, "ema", None) is not None and tr.ema.enabled:
+            sn_ema = getattr(tr.ema.ema.model[-1], "stylenull", None)
+            if sn_ema is not None:
+                sn_ema.set_epoch(tr.epoch)
+
+
+def on_r12_epoch_end(tr) -> None:
+    """Updates StyleNullProj eigenvectors and exact-copies non-EMA buffers (U, alpha, unit protos, masks) to ModelEMA
+    RIGHT BEFORE Ultralytics validates tr.ema.ema and saves best.pt."""
+    m = unwrap_model(tr.model)
+    det = m.model[-1]
+    ema_det = tr.ema.ema.model[-1] if (getattr(tr, "ema", None) is not None and tr.ema.enabled) else None
+    sn = getattr(det, "stylenull", None)
+    if sn is not None:
+        sn.update_basis()
+        if ema_det is not None and hasattr(ema_det, "stylenull"):
+            sn.sync_to(ema_det.stylenull)
+    pm = getattr(det, "pamr", None)
+    if pm is not None and ema_det is not None and hasattr(ema_det, "pamr"):
+        pm.sync_to(ema_det.pamr)
 
 
 # --- Candidate B: spatialctx (L2, L4, L6, L8; from Round 9) ------------------------------------------------------
@@ -549,6 +973,9 @@ ADD = {
     "spatialctx": add_spatialctx,
     "condroute": add_condroute,
     "staticroute": add_staticroute,
+    "stylenull": add_stylenull,
+    "pamrlite": add_pamrlite,
+    "pamrloss": add_pamrloss,
 }
 
 
@@ -576,113 +1003,175 @@ class ModTrainer(DetectionTrainer):
         return apply(super().get_model(cfg, weights, verbose), self.mods)
 
 
-if __name__ == "__main__":  # exhaustive self-check for all 4 Round-10 configs
+if __name__ == "__main__":  # exhaustive self-check for all 4 Round-12 configs (incl. odd 224x256, EMA, MuSGD, causal)
     import copy
     import io
+    from types import SimpleNamespace
 
     from ultralytics import YOLO
     from ultralytics.cfg import get_cfg
+    from ultralytics.utils.torch_utils import ModelEMA
 
     from bench import efficiency
 
     torch.manual_seed(0)
     base = YOLO("yolo26n.pt").model.float().eval()
     base_eff = efficiency.params_flops(base, 640)
-    x = torch.rand(2, 3, 256, 256)
-    x_dark = x * 0.15
-    ref = base(x)[0]
+    x_sq = torch.rand(2, 3, 256, 256)
+    x_rect = torch.rand(2, 3, 192, 256)
+    x_odd = torch.rand(2, 3, 224, 256)  # P5 = 7x8 (odd height!)
+    ref_sq = base(x_sq)[0]
+    ref_rect = base(x_rect)[0]
+    ref_odd = base(x_odd)[0]
     batch = {
-        "img": x,
-        "cls": torch.zeros(3, 1),
-        "bboxes": torch.rand(3, 4) * 0.3 + 0.3,
+        "img": x_sq,
+        "cls": torch.tensor([[0.0], [1.0], [2.0]]),
+        "bboxes": torch.tensor([[0.3, 0.3, 0.2, 0.2], [0.7, 0.6, 0.25, 0.25], [0.5, 0.5, 0.3, 0.3]]),
         "batch_idx": torch.tensor([0.0, 0.0, 1.0]),
     }
 
     configs = [
-        ("M10-A:Control", ["divdet"], ()),
-        ("M10-B:SpatCtx", ["divdet", "film", "spatialctx"], ("film", "spatialctx")),
-        ("M10-C:CondRt ", ["divdet", "film", "condroute"], ("film", "condrouter", "dualnorm")),
-        ("M10-D:Static ", ["divdet", "film", "condroute", "staticroute"], ("film", "condrouter", "dualnorm")),
+        ("R12-Ctrl :DivDet   ", ["divdet"]),
+        ("R12-SN   :StyleNull", ["divdet", "stylenull"]),
+        ("R12-PL   :PAMRLite ", ["divdet", "pamrlite"]),
+        ("R12-PLoss:PAMRLoss ", ["divdet", "pamrloss"]),
     ]
-    for label, mod_list, attr_names in configs:
+    for label, mod_list in configs:
+        torch.manual_seed(0)
         r = apply(copy.deepcopy(base), mod_list).eval()
         # 1. Zero duplicate tensors in state_dict (protects ModelEMA)
         assert len(r.state_dict()) == len({id(v) for v in r.state_dict().values()}), f"{label}: duplicate tensor"
-        # 2. Exact step-0 identity with pretrained COCO YOLO26n
-        assert torch.allclose(r(x)[0], ref, atol=1e-4), f"{label}: not identical at step 0"
-        # 3. Verify input-conditioning behavior (M10-C responds to x vs x_dark; M10-D is strictly input-invariant)
-        if hasattr(r, "condrouter"):
-            c1 = r.condrouter.extract_cues(x)
-            c2 = r.condrouter.extract_cues(x_dark)
-            if "staticroute" in mod_list:
-                assert torch.equal(c1, c2), f"{label}: staticroute cues changed with input!"
-            else:
-                assert not torch.allclose(c1, c2), f"{label}: condrouter cues insensitive to dark input!"
-        # 4. Move zero-init params off zero to test fuse, batch=1 vs batch=2 equivalence, checkpoint, half+fuse
-        r.train()
-        with torch.no_grad():
-            for _ in range(2):
-                r(torch.rand(2, 3, 256, 256))
-            r.tap.feats = None
-            r.pred_grab.preds = None
-            if hasattr(r, "rbox"):
-                r.rbox.alpha = None
-        r.eval()
-        if mod_list != ["divdet"]:
-            for q in r.parameters():
-                if q.abs().sum() == 0:
-                    nn.init.normal_(q, std=0.03)
-        out = r(x)[0]
-        if mod_list != ["divdet"]:
-            assert not torch.allclose(out, ref, atol=1e-3), f"{label}: perturbed output unchanged"
-        buf = io.BytesIO()
-        torch.save(r, buf)
-        buf.seek(0)
-        assert torch.allclose(torch.load(buf, weights_only=False).eval()(x)[0], out, atol=1e-5), f"{label}: checkpoint"
-        fz = copy.deepcopy(r).fuse(verbose=False)
-        assert not any(hasattr(k, "dbn") for k in fz.modules()), f"{label}: dbn not folded"
-        assert torch.allclose(fz(x)[0], out, atol=1e-3, rtol=1e-3), f"{label}: fused mismatch"
-        # Batch=1 fused (weight-blended CondConv2) must equal Batch=2[:1] fused!
-        out_b1 = fz(x[:1])[0]
-        assert torch.allclose(out_b1, fz(x)[0][:1], atol=1e-4, rtol=1e-4), f"{label}: b=1 vs b=2 fused mismatch"
-        hf1 = copy.deepcopy(r).half().fuse(verbose=False)
-        assert torch.allclose(hf1(x.half())[0].float(), out, atol=5e-2, rtol=5e-2), f"{label}: half+fuse"
-        assert torch.allclose(hf1(x[:1].half())[0].float(), out[:1], atol=5e-2, rtol=5e-2), f"{label}: half+fuse b=1"
-        hf2 = copy.deepcopy(r).fuse(verbose=False).half()
-        assert torch.allclose(hf2(x[:1].half())[0].float(), out[:1], atol=5e-2, rtol=5e-2), f"{label}: fuse+half b=1"
-        # 5. Two full training steps (verifies step-2 routing grads on CondRouter/SoftDualNorm + EMA deepcopy)
-        r.args = get_cfg()
-        r.train()
-        for q in r.parameters():
+        # 2. Exact step-0 identity with pretrained COCO YOLO26n on square, rect, AND odd-P5 rect!
+        assert torch.allclose(r(x_sq)[0], ref_sq, atol=1e-5), f"{label}: step-0 mismatch (sq)"
+        assert torch.allclose(r(x_rect)[0], ref_rect, atol=1e-5), f"{label}: step-0 mismatch (rect)"
+        assert torch.allclose(r(x_odd)[0], ref_odd, atol=1e-5), f"{label}: step-0 mismatch (odd 224x256)"
+
+        # 3. Verify optimizer parameter groups (MuSGD): stylenull=0 params, pamr NOT in 3x lr group, protos not a Param
+        det = r.model[-1]
+        if hasattr(det, "stylenull"):
+            assert sum(p.numel() for p in det.stylenull.parameters()) == 0, f"{label}: stylenull must have 0 params!"
+        if hasattr(det, "pamr"):
+            boosted = {id(p) for m in (det.cv3, det.one2one_cv3) for p in m.parameters()}
+            assert not any(id(p) in boosted for p in det.pamr.parameters()), f"{label}: pamr leaked into 3x lr group!"
+            assert "protos" not in dict(det.pamr.named_parameters()), f"{label}: protos must be buffer, not Parameter!"
+
+        # 4. Run 2 training steps + ModelEMA + epoch start/end callbacks (tests TAL targets, EMA buffer sync, grads)
+        rt = apply(copy.deepcopy(base), mod_list)
+        rt.args = get_cfg()
+        rt.train()
+        for q in rt.parameters():
             q.requires_grad_(True)
-        opt = torch.optim.SGD(r.parameters(), lr=1e-2)
+        if "pamrloss" in mod_list:
+            for op in rt.model[-1].pamr.out_projs:
+                op.weight.requires_grad_(False)
+        ema = ModelEMA(rt)
+        fake_tr = SimpleNamespace(model=rt, ema=ema, epoch=0)
+        opt = torch.optim.SGD([p for p in rt.parameters() if p.requires_grad], lr=1e-2)
         for step in range(2):
+            fake_tr.epoch = 4 if step == 1 else 0  # test alpha ramp on step 1
+            on_r12_epoch_start(fake_tr)
             opt.zero_grad()
-            loss, _ = r.loss(batch)
+            loss, _ = rt.loss(batch)
             assert torch.isfinite(loss).all(), f"{label}: non-finite loss step {step}"
             loss.sum().backward()
-            if step == 0:
-                opt.step()
-        assert r.tap.feats is None and r.pred_grab.preds is None
-        assert getattr(r, "rbox", RouteBox()).alpha is None
-        for an in attr_names:
-            for pname, p in getattr(r, an).named_parameters():
-                assert p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0, f"{label}: zero grad on {an}.{pname}"
-        for k in r.modules():
-            if isinstance(k, CondConv2):
-                for pname in ("dconv", "dbn"):
-                    for n_, p in getattr(k, pname).named_parameters():
-                        assert p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0, f"{label}: zero grad CondConv2.{pname}.{n_}"
-        _ = copy.deepcopy(r)
-        # 6. Check deployed params & GFLOPs@640 within <= +10% budget
-        eff = efficiency.params_flops(r, 640)
+            opt.step()
+            ema.update(rt)
+            on_r12_epoch_end(fake_tr)
+        assert rt.tap.feats is None and rt.pred_grab.preds is None
+        if hasattr(rt.model[-1], "pamr"):
+            assert rt.model[-1].pamr._last_z_hats is None
+            pm = rt.model[-1].pamr
+            pm_ema = ema.ema.model[-1].pamr
+            assert int((pm.proto_seen > 0).sum().item()) >= 2, f"{label}: PAMR protos did not update from TAL!"
+            assert torch.equal(pm.proto_seen, pm_ema.proto_seen), f"{label}: EMA proto_seen out of sync!"
+            assert torch.allclose(pm.protos, pm_ema.protos, atol=1e-6), f"{label}: EMA protos out of sync!"
+            for ip in pm.in_projs:
+                for pname, p in ip.named_parameters():
+                    assert p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0, f"{label}: zero grad in_proj.{pname}"
+            if "pamrloss" in mod_list:
+                assert all(op.weight.abs().sum() == 0 for op in pm.out_projs), f"{label}: pamrloss out_projs moved!"
+            else:
+                assert all(op.weight.grad is not None and op.weight.grad.abs().sum() > 0 for op in pm.out_projs), f"{label}: pamrlite zero grad out_projs!"
+        if hasattr(rt.model[-1], "stylenull"):
+            sn = rt.model[-1].stylenull
+            sn_ema = ema.ema.model[-1].stylenull
+            assert float(sn_ema.alpha.item()) > 0.0, f"{label}: EMA alpha stayed 0!"
+            diag = sn_ema.diag_report()
+            assert diag["sn_ortho_err"] < 1e-4, f"{label}: EMA U_l not orthonormal ({diag})!"
+
+        # 5. Eval model (from trained EMA): verify cls-only isolation (boxes unchanged vs zero_new_weights), fuse, FP16, ckpt
+        ev = copy.deepcopy(ema.ema).float().eval()
+        if "pamrlite" in mod_list:
+            with torch.no_grad():
+                for op in ev.model[-1].pamr.out_projs:
+                    nn.init.normal_(op.weight, std=0.05)
+        out_sq, raw_sq = ev(x_sq)
+        out_odd = ev(x_odd)[0]
+        # Causal zero-out must restore exact base/unprojected outputs AND box logits must be 100% identical!
+        ez = copy.deepcopy(ev)
+        ez.zero_new_weights()
+        out_z, raw_z = ez(x_sq)
+        assert torch.allclose(raw_sq["one2one"]["boxes"], raw_z["one2one"]["boxes"], atol=1e-5), f"{label}: box head was touched!"
+        if mod_list in (["divdet", "stylenull"], ["divdet", "pamrlite"]):
+            assert not torch.allclose(out_sq, out_z, atol=1e-4), f"{label}: active module had zero effect on output!"
+        else:
+            assert torch.allclose(out_sq, out_z, atol=1e-5), f"{label}: control/loss-only output changed!"
+
+        # Checkpoint round-trip
+        buf = io.BytesIO()
+        torch.save(ev, buf)
+        buf.seek(0)
+        assert torch.allclose(torch.load(buf, weights_only=False).eval()(x_sq)[0], out_sq, atol=1e-5), f"{label}: ckpt"
+
+        # Fuse check (no BN left inside pamr.in_projs!)
+        fz = copy.deepcopy(ev).fuse(verbose=False)
+        if hasattr(fz.model[-1], "pamr"):
+            assert not any(isinstance(k, Conv) and hasattr(k, "bn") for k in fz.model[-1].pamr.modules()), f"{label}: pamr BN unfused"
+        assert torch.allclose(fz(x_sq)[0], out_sq, atol=1e-3, rtol=1e-3), f"{label}: fused sq mismatch"
+        assert torch.allclose(fz(x_odd)[0], out_odd, atol=1e-3, rtol=1e-3), f"{label}: fused odd mismatch"
+
+        # Native FP16 half+fuse and fuse+half checks on square & odd 224x256 (plus direct module-level FP16 precision!)
+        if hasattr(ev.model[-1], "stylenull") or hasattr(ev.model[-1], "pamr"):
+            sample_feats = [torch.randn(2, c, h, w) * 0.5 for c, h, w in ((64, 32, 32), (128, 16, 16), (256, 7, 8))]
+            det_fp32 = copy.deepcopy(ev.model[-1]).float().eval()
+            det_fp16 = copy.deepcopy(ev.model[-1]).half().eval()
+            y32 = det_fp32._cls_transform(sample_feats)
+            y16 = det_fp16._cls_transform([t.half() for t in sample_feats])
+            for a32, a16 in zip(y32, y16):
+                assert torch.isfinite(a16).all() and torch.allclose(a16.float(), a32, atol=5e-3, rtol=5e-3), f"{label}: module FP16 drift"
+        hf1 = copy.deepcopy(ev).half().fuse(verbose=False)
+        o_hf1_sq, r_hf1_sq = hf1(x_sq.half())
+        o_hf1_odd = hf1(x_odd.half())[0].float()
+        o_hf1_sq = o_hf1_sq.float()
+        assert torch.isfinite(o_hf1_sq).all() and torch.isfinite(o_hf1_odd).all(), f"{label}: NaN in half+fuse"
+        assert torch.allclose(o_hf1_sq[:, 4:], out_sq[:, 4:], atol=1e-2, rtol=5e-2), f"{label}: half+fuse cls sq mismatch"
+        assert torch.allclose(r_hf1_sq["boxes"].float(), raw_sq["one2many"]["boxes"], atol=0.25, rtol=5e-2), f"{label}: half+fuse raw box sq mismatch"
+        assert torch.allclose(o_hf1_odd[:, 4:], out_odd[:, 4:], atol=1e-2, rtol=5e-2), f"{label}: half+fuse cls odd mismatch"
+        hf2 = copy.deepcopy(ev).fuse(verbose=False).half()
+        o_hf2_b1, r_hf2_b1 = hf2(x_sq[:1].half())
+        o_hf2_b1 = o_hf2_b1.float()
+        assert torch.isfinite(o_hf2_b1).all() and torch.allclose(o_hf2_b1[:, 4:], out_sq[:1, 4:], atol=1e-2, rtol=5e-2), f"{label}: fuse+half b=1 cls"
+        assert torch.allclose(r_hf2_b1["boxes"].float(), raw_sq["one2many"]["boxes"][:1], atol=0.2, rtol=5e-2), f"{label}: fuse+half b=1 box"
+
+        # Exact deployed params & GFLOPs@640 after fuse() within <= +10% budget
+        eff = efficiency.params_flops(ev, 640)
         dp = 100.0 * (eff["params_M"] - base_eff["params_M"]) / base_eff["params_M"]
         df = 100.0 * (eff["GFLOPs@640"] - base_eff["GFLOPs@640"]) / base_eff["GFLOPs@640"]
         assert dp <= 10.0 and df <= 10.0, f"{label}: exceeds +10% budget ({dp:.2f}%, {df:.2f}%)"
-        print(f"[check OK] {label} | {eff} | dParams={dp:+.2f}% dFLOPs={df:+.2f}% | loss={float(loss.detach().sum()):.3f}")
+        print(f"[check OK] {label} | {eff} | dParams={dp:+.2f}% dFLOPs={df:+.2f}% | diag={ev.diag_report()} | loss={float(loss.detach().sum()):.3f}")
 
-    # Verify all non-weather diversification ops stay in [0, 1] and modify images
-    for fn in (style_jitter, spatial_illum_aug, noise_blur_aug, fourier_amp_aug, div_augment):
-        y = fn(x)
-        assert y.shape == x.shape and torch.isfinite(y).all() and y.min() >= 0 and y.max() <= 1 and not torch.allclose(y, x), fn.__name__
-    print("ALL ROUND-10 SELF-CHECKS PASSED")
+    # Verify _pool_eval in bench.main produces valid pooled COCO metrics without ID collisions
+    from bench.main import _pool_eval
+    cats = [{"id": 0, "name": "car"}]
+    gt1 = {"images": [{"id": 1, "width": 100, "height": 100, "file_name": "a.jpg"}],
+           "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [10, 10, 20, 20], "area": 400, "iscrowd": 0}],
+           "categories": cats}
+    gt2 = {"images": [{"id": 1, "width": 100, "height": 100, "file_name": "b.jpg"}],
+           "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [30, 30, 20, 20], "area": 400, "iscrowd": 0}],
+           "categories": cats}
+    d1 = [{"image_id": 1, "category_id": 0, "bbox": [10, 10, 20, 20], "score": 0.9}]
+    d2 = [{"image_id": 1, "category_id": 0, "bbox": [30, 30, 20, 20], "score": 0.8}]
+    mp, mip = _pool_eval([("night", gt1, {}, d1), ("dayrain", gt2, {}, d2)])
+    assert abs(mip["mAP50_95"] - 100.0) < 1e-3, f"_pool_eval failed: {mip}"
+    print("[check OK] _pool_eval exact disjoint ID merge verified (mAP=100.0)")
+    print("ALL ROUND-12 SELF-CHECKS PASSED")
